@@ -1,0 +1,2 @@
+playwright>=1.44.0
+plyer>=2.1.0
