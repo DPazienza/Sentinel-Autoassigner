@@ -228,6 +228,20 @@ class Storage:
                 first_seen_active=COALESCE(incidents.first_seen_active,excluded.first_seen_active), last_seen=excluded.last_seen,
                 workspace_hint=COALESCE(NULLIF(excluded.workspace_hint,''),incidents.workspace_hint), source_page=COALESCE(NULLIF(excluded.source_page,''),incidents.source_page)''',
                 (key,title,severity,created,last_update,ts,ts,ts,workspace,source))
+    def sync_visible_incidents(self, visible_keys):
+        """
+        Keep dashboard aligned with the current Sentinel grid.
+        Incidents not visible anymore, for example because they were closed or filtered out,
+        are removed from the dashboard local state.
+        """
+        keys = [str(k) for k in visible_keys if k]
+        with self.connect() as con:
+            if not keys:
+                con.execute("DELETE FROM incidents")
+                return
+            placeholders = ",".join(["?"] * len(keys))
+            con.execute(f"DELETE FROM incidents WHERE incident_key NOT IN ({placeholders})", keys)
+
     def incidents(self, limit=500):
         with self.connect() as con:
             con.row_factory = sqlite3.Row
@@ -400,13 +414,25 @@ class SentinelPageBot:
         return None
 
     def panel_text(self, full, key):
+        """
+        Extract right detail pane text.
+
+        The incident ID appears both in the grid row and in the right detail pane.
+        Using the first ID occurrence can parse table headers as fields.
+        """
         if not key:
             return full
 
-        for p in [f'Incident number {key}', f'Incident number\n{key}', key]:
-            idx = full.find(p)
-            if idx >= 0:
-                return full[max(0, idx - 500):min(len(full), idx + 4500)]
+        pattern = re.compile(rf"Incident number\s*{re.escape(str(key))}", re.I)
+        matches = list(pattern.finditer(full))
+        if matches:
+            idx = matches[-1].start()
+            return full[max(0, idx - 800):min(len(full), idx + 5000)]
+
+        positions = [m.start() for m in re.finditer(rf"\b{re.escape(str(key))}\b", full)]
+        if positions:
+            idx = positions[-1]
+            return full[max(0, idx - 800):min(len(full), idx + 5000)]
 
         return full
 
@@ -417,11 +443,20 @@ class SentinelPageBot:
 
     def near_label(self, lines, label):
         lab = label.lower()
+        bad_values = {
+            'severity', 'status', 'owner', 'incident number', 'created time',
+            'creation time', 'last update time', 'title', 'alerts', 'incident provider name',
+            'alert product name'
+        }
         for i, line in enumerate(lines):
             if line.lower() == lab:
+                # Sentinel detail pane usually renders Value above Label.
                 for j in [i - 1, i + 1]:
-                    if 0 <= j < len(lines) and lines[j].lower() != lab and len(lines[j]) <= 140:
-                        return lines[j]
+                    if 0 <= j < len(lines):
+                        candidate = lines[j]
+                        c = candidate.lower()
+                        if c != lab and c not in bad_values and len(candidate) <= 160:
+                            return candidate
         return ''
 
     def details(self, panel):
@@ -501,43 +536,79 @@ class SentinelPageBot:
         self.wait(1000)
         return self.read_open_incident_details(incident_key)
 
+    def safe_locator_click(self, locator, timeout=1000):
+        """
+        Sentinel often keeps hidden duplicated text nodes in the DOM.
+        Click only visible locators and never raise a timeout to the UI.
+        """
+        try:
+            if not locator.is_visible(timeout=timeout):
+                return False
+        except Exception:
+            return False
+
+        try:
+            locator.scroll_into_view_if_needed(timeout=timeout)
+        except Exception:
+            pass
+
+        try:
+            locator.click(timeout=timeout)
+            return True
+        except Exception:
+            return False
+
     def click_text(self, texts, exact_first=True, timeout=2000):
         for txt in texts:
+            locators_to_try = []
+
             if exact_first:
                 try:
-                    loc = self.page.get_by_text(txt, exact=True).last
-                    loc.wait_for(state='visible', timeout=timeout)
-                    loc.click()
-                    return True
+                    loc = self.page.get_by_text(txt, exact=True)
+                    count = min(loc.count(), 30)
+                    for i in reversed(range(count)):
+                        locators_to_try.append(loc.nth(i))
                 except Exception:
                     pass
 
             try:
-                loc = self.page.get_by_text(txt, exact=False).last
-                loc.wait_for(state='visible', timeout=timeout)
-                loc.click()
-                return True
+                loc = self.page.get_by_text(txt, exact=False)
+                count = min(loc.count(), 30)
+                for i in reversed(range(count)):
+                    locators_to_try.append(loc.nth(i))
             except Exception:
                 pass
+
+            for loc in locators_to_try:
+                if self.safe_locator_click(loc, timeout=min(timeout, 1200)):
+                    return True
 
         return False
 
     def click_button_text(self, texts, timeout=2500):
         for txt in texts:
+            locators_to_try = []
+
             try:
-                loc = self.page.get_by_role('button', name=re.compile(re.escape(txt), re.I)).last
-                loc.wait_for(state='visible', timeout=timeout)
-                loc.click()
-                return True
+                loc = self.page.get_by_role('button', name=re.compile(re.escape(txt), re.I))
+                count = min(loc.count(), 20)
+                for i in reversed(range(count)):
+                    locators_to_try.append(loc.nth(i))
             except Exception:
                 pass
+
             try:
-                loc = self.page.get_by_text(txt, exact=True).last
-                loc.wait_for(state='visible', timeout=timeout)
-                loc.click()
-                return True
+                loc = self.page.get_by_text(txt, exact=True)
+                count = min(loc.count(), 20)
+                for i in reversed(range(count)):
+                    locators_to_try.append(loc.nth(i))
             except Exception:
                 pass
+
+            for loc in locators_to_try:
+                if self.safe_locator_click(loc, timeout=min(timeout, 1200)):
+                    return True
+
         return False
 
     def apply_open_panel_if_present(self, timeout=2500):
@@ -647,6 +718,8 @@ class SentinelPageBot:
                 for i in range(count):
                     try:
                         item = loc.nth(i)
+                        if not item.is_visible(timeout=min(timeout, 500)):
+                            continue
                         vbox = item.bounding_box(timeout=timeout)
                         if not vbox:
                             continue
@@ -665,9 +738,9 @@ class SentinelPageBot:
                         continue
 
             if best is not None:
-                best.click(timeout=timeout)
-                self.wait(300)
-                return True
+                if self.safe_locator_click(best, timeout=min(timeout, 1000)):
+                    self.wait(300)
+                    return True
 
             # Last resort relative to label: click just above the label.
             try:
@@ -698,12 +771,14 @@ class SentinelPageBot:
             for i in range(count):
                 try:
                     item = loc.nth(i)
+                    if not item.is_visible(timeout=min(timeout, 500)):
+                        continue
                     box = item.bounding_box(timeout=timeout)
                     if not box:
                         continue
                     if box['x'] >= min_x and box['y'] <= max_y:
-                        item.click(timeout=timeout)
-                        return True
+                        if self.safe_locator_click(item, timeout=min(timeout, 1000)):
+                            return True
                 except Exception:
                     continue
 
@@ -719,12 +794,14 @@ class SentinelPageBot:
             for i in range(count):
                 try:
                     item = loc.nth(i)
+                    if not item.is_visible(timeout=min(timeout, 500)):
+                        continue
                     box = item.bounding_box(timeout=timeout)
                     if not box:
                         continue
                     if box['x'] >= min_x and box['y'] <= max_y:
-                        item.click(timeout=timeout)
-                        return True
+                        if self.safe_locator_click(item, timeout=min(timeout, 1000)):
+                            return True
                 except Exception:
                     continue
 
@@ -914,7 +991,7 @@ class SentinelPageBot:
 
         key = expected_key
         title = fallback_title
-        severity = d['severity'] or fallback_severity
+        severity = fallback_severity or d['severity']
         status = d['status']
         owner = d['owner']
         workspace = self.workspace_hint()
@@ -1058,6 +1135,9 @@ class SentinelPageBot:
             s, p = self.process_incident_by_id(target, dry_run, fetch_only)
             scanned += 1 if s else 0
             processed += 1 if p else 0
+
+        # Remove stale incidents from dashboard that are no longer present in the current Sentinel view.
+        self.store.sync_visible_incidents([x.get('incident_key') for x in snapshot])
 
         return scanned, processed
 

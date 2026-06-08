@@ -460,3 +460,51 @@ data/bot_state.sqlite3
 ```
 
 So the behavior is kept after reopening the app.
+
+
+## Dashboard sync + detail-pane parsing fix
+
+This release fixes two dashboard bugs.
+
+### Closed incidents still visible
+
+After every fetch/scan, the local dashboard is synchronized with the current Sentinel grid:
+
+```text
+incident visible in Sentinel grid    -> stays in dashboard
+incident no longer visible           -> removed from dashboard
+```
+
+This removes incidents that were closed in Sentinel or disappeared because of the current filters.
+
+### Wrong severity/owner values
+
+The bot now prefers the explicit right detail pane marker:
+
+```text
+Incident number <ID>
+```
+
+instead of the first occurrence of the incident ID in the page. This prevents parsing table headers as incident fields.
+
+Also, severity from the Sentinel grid row is preferred over detail-pane severity when available.
+
+
+## Invisible duplicated text click fix
+
+This release fixes Playwright timeout errors like:
+
+```text
+Locator.click: Timeout exceeded
+get_by_text('Unassigned', exact=True).nth(1)
+element is not visible
+```
+
+Sentinel keeps duplicated/hidden Owner and Status values in the page DOM. The bot now:
+
+```text
+- checks locator visibility before clicking
+- skips hidden duplicated values
+- tries visible menu items from newest to oldest
+- returns False instead of raising popup errors for invisible elements
+```
