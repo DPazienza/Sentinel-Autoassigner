@@ -1,510 +1,564 @@
 # Sentinel Auto Assign Bot - Desktop App
 
-Questa versione apre una vera app desktop, non una dashboard web.
+Applicazione desktop Windows per aiutare il SOC nella gestione operativa degli incident Microsoft Sentinel direttamente dalla pagina web del portale Azure, senza usare API.
 
-## Cosa fa
+L'app si collega a una tab Sentinel già aperta su Chrome o Edge, legge gli incident visibili nella vista corrente, può assegnare automaticamente gli incident `Unassigned` all'utente corrente, portarli in `Active` e monitorare gli SLA/KPI principali.
 
-- Ti permette di avviare Chrome o Edge in modalità controllabile dal bot.
-- Elenca le tab aperte su Chrome/Edge.
-- Ti permette di selezionare la tab Sentinel corretta, utile se lavori con più browser o più workspace.
-- Ha un pulsante `FETCH CURRENT VIEW` che legge gli incident senza modificarli.
-- Ha `START REAL BOT` per assegnare i `New + Unassigned` e portarli in `Active`.
-- Ha SLA configurabili e notifiche Windows al raggiungimento della percentuale scelta, default 60%.
+---
 
-## Limite importante
+## 1. Cosa fa il bot
 
-Non è possibile trascinare fisicamente una tab Chrome/Edge/Firefox dentro l'app e controllarla in modo affidabile.
-La soluzione corretta è selezionare la tab dalla lista dopo aver aperto Chrome/Edge con remote debugging.
+Il bot lavora sulla vista `Microsoft Sentinel > Incidents` aperta nel browser.
 
-Firefox non è supportato per agganciare una tab già aperta. Chrome ed Edge sì.
+Funzioni principali:
 
-## Installazione
+```text
+- legge gli incident visibili nella tab Sentinel selezionata
+- popola una dashboard locale con ID, severity, status, owner, title e timestamp
+- assegna a te gli incident con Owner = Unassigned
+- mette in Active gli incident assegnati a te se Status = New
+- non tocca incident assegnati ad altri utenti
+- monitora i KPI Taking Charge e Notification
+- mostra popup persistenti per notifiche SLA
+- salva configurazione SLA e owner locale nel database dell'app
+```
 
-Esegui:
+Il bot non usa API Sentinel/Azure. Opera solo tramite interazione controllata con la pagina web.
+
+---
+
+## 2. Browser supportati
+
+Supportati:
+
+```text
+Google Chrome
+Microsoft Edge
+```
+
+Non supportato:
+
+```text
+Firefox
+```
+
+Firefox non espone in modo affidabile lo stesso protocollo di controllo usato da Chrome/Edge per agganciarsi a una tab già aperta.
+
+---
+
+## 3. File inclusi
+
+Dopo l'estrazione dello ZIP trovi:
+
+```text
+app.py
+requirements.txt
+install_windows.bat
+run_desktop_app_windows.bat
+run_desktop_app_debug_console_windows.bat
+run_desktop_app_hidden_windows.vbs
+reset_local_state_windows.bat
+start_chrome_debug_windows.bat
+start_edge_debug_windows.bat
+README.md
+```
+
+Uso normale:
 
 ```text
 install_windows.bat
-```
-
-## Avvio
-
-Esegui:
-
-```text
 run_desktop_app_windows.bat
 ```
 
-## Flusso
-
-1. Apri l'app.
-2. Clicca `Launch Chrome for bot` o `Launch Edge for bot`.
-3. Fai login Azure, MFA e PIM.
-4. Vai su Microsoft Sentinel > Incidents.
-5. Premi `Refresh browser tabs`.
-6. Seleziona la tab del workspace corretto.
-7. Premi `FETCH CURRENT VIEW`.
-8. Controlla la tabella degli incident visti dal bot.
-9. Se i dati sono corretti, premi `START REAL BOT`.
-
-## Porte locali
-
-- Chrome: 127.0.0.1:9222
-- Edge: 127.0.0.1:9223
-
-Non esporre queste porte sulla rete.
-
-
-## Fix auto-link tab
-
-Questa versione avvia Chrome/Edge con un profilo dedicato in:
-
-```text
-browser_profiles/chrome_bot_profile
-browser_profiles/edge_bot_profile
-```
-
-Questo è necessario perché, se Chrome/Edge è già aperto normalmente, il comando di avvio spesso riusa il processo esistente e la porta di debug non viene attivata. In quel caso l'app non vede nessuna scheda.
-
-Con il profilo dedicato:
-
-```text
-Launch Chrome for bot
-→ apre una nuova finestra Chrome debuggabile
-→ l'app fa Refresh automaticamente
-→ seleziona automaticamente la tab Azure/Sentinel
-```
-
-Se hai più workspace aperti, puoi comunque selezionare manualmente la tab corretta nella tabella.
-
-
-## Fixed BROWSER_PROFILE_DIR
-
-Questa release corregge l'errore:
-
-```text
-NameError: name 'BROWSER_PROFILE_DIR' is not defined
-```
-
-e crea automaticamente la cartella:
-
-```text
-browser_profiles/
-```
-
-usata per avviare Chrome/Edge in modalità bot.
-
-
-## No-refresh fetch + auto-fetch
-
-Questa release cambia il comportamento di `FETCH CURRENT VIEW`:
-
-```text
-prima: ricaricava la pagina Sentinel
-ora: legge direttamente la schermata corrente senza refresh
-```
-
-Quindi non modifica i filtri, non riapre la blade e non cambia la vista impostata manualmente su Sentinel.
-
-Inoltre la dashboard fa automaticamente una fetch ogni 20 secondi quando:
-
-```text
-- una tab Sentinel è selezionata
-- il bot real/dry-run non è in esecuzione
-- l'app non è in pausa
-```
-
-Puoi cambiare l'intervallo dalla sezione SLA/settings:
-
-```text
-Auto fetch sec
-```
-
-Se premi `START REAL BOT`, invece, entra in gioco lo scan del bot con l'intervallo `Scan sec`.
-
-
-## SLA breach time based on Created
-
-La tabella `Incidents seen by bot` ora include due nuove colonne:
-
-```text
-SLA Notify At
-SLA Due At
-```
-
-La colonna `SLA Due At` viene calcolata come:
-
-```text
-Creation time + SLA della severity
-```
-
-Esempio:
-
-```text
-Created = 06/06/26, 04:23 PM
-Severity = Informational
-Info SLA = 480 min
-SLA Due At = 06/07/26, 12:23 AM
-```
-
-La colonna `SLA Notify At` usa invece la percentuale configurata, ad esempio 60% dello SLA.
-
-
-## Fix fetch + silent app
-
-Questa release corregge l'errore:
-
-```text
-NameError: name 'add_minutes_to_sentinel_datetime' is not defined
-```
-
-`FETCH CURRENT VIEW` torna a funzionare e mantiene le colonne:
-
-```text
-SLA Notify At
-SLA Due At
-```
-
-## Avvio senza shell
-
-Per uso normale:
-
-```text
-run_desktop_app_windows.bat
-```
-
-Questo usa `pythonw.exe`, quindi la shell non resta aperta.
-
-Se vuoi vedere errori o log in console:
+Uso debug:
 
 ```text
 run_desktop_app_debug_console_windows.bat
 ```
 
-Versione completamente nascosta:
+Reset stato locale:
 
 ```text
-run_desktop_app_hidden_windows.vbs
+reset_local_state_windows.bat
 ```
 
-## Chiusura
+---
 
-Premendo la `X` sulla finestra dell'app, il bot viene fermato e il processo Python viene terminato.
+## 4. Installazione
 
+### Requisiti
 
-## Safe assignment fix
+Serve Python 3.10 o superiore installato su Windows.
 
-Questa release corregge il problema in cui il bot poteva assegnare un incident e poi disassegnarlo.
-
-Cause probabile:
+Durante l'installazione di Python deve essere abilitata l'opzione:
 
 ```text
-il bot cliccava testi generici come "Unassigned" o "New" nella pagina intera;
-Azure/Sentinel ha molti elementi simili nella lista, nei filtri e nel detail pane;
-un click successivo poteva riaprire il menu Owner e causare un unassign.
+Add python.exe to PATH
 ```
 
-Fix implementati:
+### Procedura
+
+1. Estrai lo ZIP in una cartella locale.
+2. Apri la cartella estratta.
+3. Esegui:
 
 ```text
-- Owner: click diretto sull'area Owner del detail pane, non sul testo generico "Unassigned"
-- Status: click diretto sull'area Status del detail pane, non sul testo generico "New"
-- rimosso click generico su Apply/Save
-- se un incident è già stato preso dal bot, non viene mai più toccato l'Owner
-- dopo Assign to me, l'incident viene marcato subito localmente per evitare retry pericolosi
+install_windows.bat
 ```
 
+L'installer crea un virtual environment `.venv` e installa le dipendenze necessarie.
 
-## ID-based processing fix
+---
 
-Questa release cambia la logica del bot:
+## 5. Avvio dell'app
+
+Per uso normale esegui:
 
 ```text
-1. legge prima la lista degli ID visibili
-2. prende il primo ID
-3. apre dinamicamente la riga con quell'ID
-4. verifica che il detail pane aperto contenga lo stesso ID
-5. controlla Owner:
-   - se Unassigned -> Assign to me
-   - altrimenti non tocca l'Owner
-6. ricontrolla lo stesso ID aperto
-7. controlla Status:
-   - se New -> Active
-   - altrimenti non tocca lo Status
-8. passa all'ID successivo cercandolo di nuovo nella lista corrente
+run_desktop_app_windows.bat
 ```
 
-Questo evita il problema in cui, dopo l'assegnazione, la lista Sentinel si riordina o una riga sparisce e il bot finisce per agire sull'incident sbagliato.
+Questo avvia l'app senza lasciare una shell aperta.
 
-
-## Remaining SLA minutes
-
-La tabella non mostra più l'orario assoluto di notifica/SLA.
-
-Ora mostra:
+Per vedere eventuali errori in console usa:
 
 ```text
-Min To Notify = minuti mancanti alla notifica SLA, calcolati da Created
-Min To SLA    = minuti mancanti alla scadenza SLA, calcolati da Created
+run_desktop_app_debug_console_windows.bat
 ```
 
-Esempio:
+La finestra dell'app può essere chiusa con la `X`. La chiusura termina anche il processo Python.
+
+---
+
+## 6. Primo collegamento a Sentinel
+
+Flusso consigliato:
 
 ```text
-Created = 10:00
-High SLA = 60 min
-Notify at = 60%
-Ora = 10:20
-
-Min To Notify = 16 min
-Min To SLA = 40 min
+1. Avvia l'app
+2. Clicca Launch Chrome for bot oppure Launch Edge for bot
+3. Fai login su Azure
+4. Accetta MFA
+5. Attiva eventuale PIM
+6. Vai su Microsoft Sentinel > Incidents
+7. Premi Refresh browser tabs se la tab non compare
+8. Seleziona la tab Sentinel corretta nella tabella Browser / workspace selection
+9. Premi FETCH CURRENT VIEW NOW
 ```
 
-Se la soglia è già superata, la tabella mostra:
+Se la tab viene letta correttamente, gli incident appaiono nella dashboard.
+
+---
+
+## 7. Sezione Browser / workspace selection
+
+Questa sezione mostra le tab browser agganciate al bot.
+
+Colonne:
+
+```text
+Browser
+Sentinel
+Title
+Url
+```
+
+Usala per selezionare la tab Sentinel corretta, soprattutto se hai più workspace o più browser aperti.
+
+Se cambi workspace o tab, premi:
+
+```text
+Refresh browser tabs
+```
+
+e seleziona di nuovo la tab corretta.
+
+---
+
+## 8. Bot controls
+
+### FETCH CURRENT VIEW NOW
+
+Legge gli incident visibili nella pagina Sentinel selezionata e aggiorna la dashboard.
+
+Non modifica nulla su Sentinel.
+
+Non cambia:
+
+```text
+owner
+status
+filtri
+incident
+```
+
+Serve per verificare che il bot stia leggendo correttamente la vista corrente.
+
+### START REAL BOT
+
+Avvia il bot in modalità reale.
+
+Il bot esegue questa logica:
+
+```text
+Per ogni incident visibile:
+    se Owner = Unassigned:
+        Assign to me
+        Apply
+        verifica owner
+
+    se Owner = me e Status = New:
+        Status = Active
+        verifica status
+
+    se Owner = qualcun altro:
+        skip
+```
+
+Il bot usa sempre l'Incident ID come riferimento. Se la lista cambia ordine, cerca di nuovo l'ID prima di agire.
+
+### START DRY-RUN
+
+Avvia una simulazione.
+
+Il bot legge cosa farebbe, ma non modifica Sentinel.
+
+Da usare prima della modalità reale quando vuoi testare la logica.
+
+### PAUSE
+
+Mette in pausa il bot.
+
+La pausa ha effetto prima del prossimo incident.
+
+### RESUME
+
+Riprende il bot dopo una pausa.
+
+### STOP
+
+Ferma il ciclo automatico.
+
+L'app resta aperta e puoi continuare a usare `FETCH CURRENT VIEW NOW`.
+
+---
+
+## 9. Regole di sicurezza operative
+
+Il bot rispetta queste regole:
+
+```text
+Owner = Unassigned
+    -> il bot può assegnarlo a te
+
+Owner = me
+    -> il bot può metterlo in Active se è ancora New
+
+Owner = altro utente
+    -> il bot non assegna
+    -> il bot non cambia status
+    -> skip
+```
+
+Il bot impara automaticamente il tuo owner display name dopo un `Assign to me` riuscito e lo salva localmente.
+
+---
+
+## 10. SLA / KPI gestiti
+
+Il bot gestisce due KPI operativi:
+
+```text
+Taking Charge Time
+Notification Time
+```
+
+### Taking Charge Time
+
+Indica entro quanto un incident deve essere preso in carico.
+
+Default:
+
+```text
+Critical: 30 min
+High:     30 min
+Medium:   60 min
+Low:      60 min
+Info:     60 min fallback
+```
+
+### Notification Time
+
+Indica entro quanto deve partire la notifica popup all'utente.
+
+Default:
+
+```text
+Critical: 30 min
+High:     60 min
+Medium:   240 min
+Low:      480 min
+Info:     480 min fallback
+```
+
+Il popup SLA usa il KPI `Notification Time`, non una percentuale del Taking Charge.
+
+---
+
+## 11. Sezione SLA settings
+
+La sezione permette di modificare i valori in minuti.
+
+Campi principali:
+
+```text
+Taking Charge:
+    Crit
+    High
+    Med
+    Low
+    Info
+
+Notification:
+    Crit
+    High
+    Med
+    Low
+    Info
+
+Bot:
+    Scan sec
+    Repeat min
+    Auto fetch
+```
+
+### Scan sec
+
+Intervallo del bot quando è avviato in modalità reale o dry-run.
+
+### Repeat min
+
+Dopo quanti minuti può essere ripetuta una notifica SLA già inviata per lo stesso incident.
+
+### Auto fetch
+
+Intervallo di aggiornamento automatico della dashboard quando il bot non è in esecuzione.
+
+Dopo aver modificato i valori premi:
+
+```text
+SAVE SLA SETTINGS
+```
+
+Le impostazioni vengono salvate localmente e restano disponibili anche dopo la riapertura dell'app.
+
+---
+
+## 12. Dashboard incident
+
+La tabella `Incidents seen by bot` mostra gli incident visibili nella vista Sentinel corrente.
+
+Colonne principali:
+
+```text
+Incident
+Severity
+Status
+Owner
+Title
+Created
+Min To Taking Charge
+Min To Notify
+Last Notified
+Last Update
+Active Since
+Age
+Workspace
+```
+
+### Min To Taking Charge
+
+Minuti mancanti alla scadenza del KPI Taking Charge.
+
+Se la soglia è già superata mostra:
 
 ```text
 OVERDUE X min
 ```
 
+### Min To Notify
 
-## Control + assignment reliability fix
+Minuti mancanti alla scadenza del KPI Notification.
 
-Questa release corregge due punti:
-
-### 1. Bottoni Pause / Resume / Stop
-
-Prima i bottoni passavano solo dalla coda del worker. Se il worker era dentro uno scan lungo,
-il comando veniva letto solo alla fine dello scan.
-
-Ora i bottoni aggiornano subito lo stato del worker:
-
-```text
-PAUSE -> si ferma prima del prossimo incident
-STOP  -> interrompe il ciclo prima del prossimo incident
-RESUME -> riprende
-```
-
-### 2. Assign/Active più robusto
-
-La logica rimane ID-based:
-
-```text
-- prende l'ID
-- apre quell'ID
-- verifica che il detail pane sia lo stesso ID
-- se Owner = Unassigned, prova Assign to me
-- se Status = New, prova Active
-```
-
-In più ora, se il click diretto sull'area Owner/Status non apre il menu, usa un fallback controllato:
-
-```text
-Owner fallback: clicca "Unassigned" solo se il dettaglio ha confermato Owner = Unassigned
-Status fallback: clicca "New" solo se il dettaglio ha confermato Status = New
-```
-
-Questo dovrebbe risolvere il caso in cui legge gli incident ma non esegue l'assegnazione.
-
-
-## Apply + verify fix
-
-Questa release corregge il problema visto nello screenshot:
-
-```text
-il bot apriva il menu Owner e selezionava "Assign to me",
-ma non premeva Apply.
-```
-
-Ora la logica è:
-
-```text
-Owner:
-1. apre menu Owner
-2. seleziona Assign to me
-3. preme Apply
-4. rilegge la UI
-5. segna SUCCESS solo se Owner non è più Unassigned
-
-Status:
-1. apre menu Status
-2. seleziona Active
-3. preme Apply se presente
-4. rilegge la UI
-5. segna SUCCESS solo se Status è davvero Active
-```
-
-La dashboard non marca più l'incident come Active/me in modo ottimistico: aggiorna lo stato solo dopo verifica reale dalla schermata Sentinel.
-
-
-## Status click + speed fix
-
-Questa release corregge il problema in cui il bot assegnava l'owner ma non metteva l'incident in Active.
-
-Cambiamenti:
-
-```text
-- click sullo Status fatto cercando "New" solo nella detail pane destra, non nella tabella
-- coordinate Status aggiornate per la riga alta della detail pane
-- selezione "Active" cercata solo nel menu/pannello destro
-- dopo Status=Active verificato, il bot preme Refresh sulla toolbar Sentinel
-- ridotti diversi tempi di attesa per rendere il ciclo più veloce
-```
-
-Il flusso reale ora è:
-
-```text
-1. apre incident ID
-2. se Owner = Unassigned -> Assign to me + Apply + verifica
-3. se Status = New -> Active + verifica
-4. Refresh Sentinel
-5. passa all'ID successivo
-```
-
-
-## Zoom/screen safe status + SLA local time fix
-
-Questa release corregge tre punti:
-
-### 1. Status Active non cliccato
-
-Il bot non usa più coordinate fisse per Owner/Status.
-Ora cerca la label nella detail pane:
-
-```text
-Owner  -> clicca il valore sopra la label Owner
-Status -> clicca il valore sopra la label Status
-```
-
-Questo dovrebbe funzionare anche con zoom diverso dal 100% e su monitor con dimensioni diverse.
-
-### 2. Status Active immediato dopo Assign
-
-Dopo `Assign to me + Apply`, il bot controlla subito lo stesso incident ID e, se lo Status è ancora `New`, apre il menu Status e seleziona `Active`.
-
-Dopo `Active` verificato, preme Refresh sulla toolbar Sentinel.
-
-### 3. SLA Remaining
-
-Il calcolo dei minuti rimanenti ora usa l'ora locale del browser/macchina, non UTC. Sentinel mostra gli orari nella UI come orari locali, quindi il calcolo precedente poteva risultare sfasato.
-
-
-## Persistent SLA popup + saved settings
-
-This release changes SLA notifications:
-
-```text
-- SLA notification is based on Created time
-- notification triggers when elapsed time reaches the configured percentage, e.g. 60%
-- Windows toast/beep is still used
-- the desktop app also opens a persistent topmost popup
-- the popup closes only when the user clicks ACKNOWLEDGE
-```
-
-The incidents table now includes:
-
-```text
-Last Notified
-```
-
-SLA settings are now persisted in the local SQLite database:
-
-```text
-data/bot_state.sqlite3
-```
-
-When you reopen the app, saved SLA values are automatically restored.
-
-
-## Last Notified local time + skip other owners
-
-This release changes two final behaviors.
+Quando viene raggiunta questa soglia, il bot mostra il popup SLA.
 
 ### Last Notified
 
-`Last Notified` now uses the system local timestamp and displays only:
+Ora dell'ultima notifica inviata dal bot per quell'incident.
+
+Formato:
 
 ```text
 HH:MM
 ```
 
-Example:
+---
+
+## 13. Notifiche SLA
+
+Quando un incident supera il KPI Notification, il bot mostra:
 
 ```text
-14:37
+popup persistente nell'app
+toast/beep Windows
 ```
 
-The repeat-notification logic also uses the system-local timestamp for newly generated notifications.
-
-### Assigned to other users
-
-The bot no longer changes incidents assigned to another user.
-
-Rule:
+Il popup persistente resta visibile finché l'utente non clicca:
 
 ```text
-Owner = Unassigned
-    -> Assign to me
-    -> then Set Active
-
-Owner = me
-    -> may Set Active if Status is New
-
-Owner = someone else
-    -> do not assign
-    -> do not change status
+ACKNOWLEDGE
 ```
 
-The bot learns the current user's owner display name after a successful `Assign to me` and saves it locally in:
+La notifica viene registrata nella colonna:
+
+```text
+Last Notified
+```
+
+---
+
+## 14. Actions / logs
+
+La tab `Actions / logs` mostra le operazioni eseguite o simulate dal bot.
+
+Esempi:
+
+```text
+FETCH
+DRY_RUN
+ASSIGN_TO_ME
+SET_ACTIVE
+SLA_WARNING
+SKIP_OTHER_OWNER
+```
+
+Usala per capire cosa ha fatto il bot su ogni incident.
+
+---
+
+## 15. Sincronizzazione dashboard
+
+Dopo ogni fetch o scan, la dashboard viene sincronizzata con la vista Sentinel corrente.
+
+Se un incident non è più visibile perché è stato chiuso o filtrato fuori, viene rimosso dalla dashboard locale.
+
+Il bot non cancella nulla da Sentinel. Rimuove solo la riga dalla dashboard locale.
+
+---
+
+## 16. Stato locale
+
+L'app salva dati locali in:
 
 ```text
 data/bot_state.sqlite3
 ```
 
-So the behavior is kept after reopening the app.
-
-
-## Dashboard sync + detail-pane parsing fix
-
-This release fixes two dashboard bugs.
-
-### Closed incidents still visible
-
-After every fetch/scan, the local dashboard is synchronized with the current Sentinel grid:
+Contiene:
 
 ```text
-incident visible in Sentinel grid    -> stays in dashboard
-incident no longer visible           -> removed from dashboard
+incident letti
+azioni/log
+ultimo timestamp di notifica
+SLA configurati
+owner display name dell'utente
 ```
 
-This removes incidents that were closed in Sentinel or disappeared because of the current filters.
-
-### Wrong severity/owner values
-
-The bot now prefers the explicit right detail pane marker:
+Per resettare lo stato locale:
 
 ```text
-Incident number <ID>
+reset_local_state_windows.bat
 ```
 
-instead of the first occurrence of the incident ID in the page. This prevents parsing table headers as incident fields.
+---
 
-Also, severity from the Sentinel grid row is preferred over detail-pane severity when available.
+## 17. Uso consigliato
 
-
-## Invisible duplicated text click fix
-
-This release fixes Playwright timeout errors like:
+Flusso sicuro:
 
 ```text
-Locator.click: Timeout exceeded
-get_by_text('Unassigned', exact=True).nth(1)
-element is not visible
+1. Avvia l'app
+2. Lancia Chrome/Edge dal bottone dell'app
+3. Login Azure + MFA + PIM
+4. Apri Sentinel > Incidents
+5. Premi FETCH CURRENT VIEW NOW
+6. Verifica la dashboard
+7. Premi START DRY-RUN
+8. Controlla Actions / logs
+9. Premi START REAL BOT
 ```
 
-Sentinel keeps duplicated/hidden Owner and Status values in the page DOM. The bot now:
+---
+
+## 18. Troubleshooting
+
+### La tab Sentinel non compare
+
+Premi:
 
 ```text
-- checks locator visibility before clicking
-- skips hidden duplicated values
-- tries visible menu items from newest to oldest
-- returns False instead of raising popup errors for invisible elements
+Refresh browser tabs
 ```
+
+Se ancora non compare:
+
+```text
+1. Chiudi Chrome/Edge
+2. Riapri il browser dal bottone dell'app
+3. Fai login
+4. Torna su Sentinel > Incidents
+5. Premi Refresh browser tabs
+```
+
+### Il bot legge incident vecchi o chiusi
+
+Premi:
+
+```text
+FETCH CURRENT VIEW NOW
+```
+
+La dashboard si riallinea con la vista Sentinel corrente.
+
+### Il bot non assegna un incident
+
+Controlla `Owner`.
+
+Se l'incident è assegnato a un altro utente, il bot lo salta volutamente.
+
+### Il bot non mette in Active
+
+Controlla che l'incident sia assegnato a te.
+
+Il bot cambia status solo se:
+
+```text
+Owner = me
+Status = New
+```
+
+### Voglio vedere errori tecnici
+
+Avvia:
+
+```text
+run_desktop_app_debug_console_windows.bat
+```
+
+---
+
+## 19. Nota operativa
+
+Il bot lavora solo sugli incident visibili nella vista Sentinel selezionata.
+
+Quindi filtri, severity, status e workspace impostati in Sentinel determinano cosa il bot vede e processa.

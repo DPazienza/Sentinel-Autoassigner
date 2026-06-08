@@ -157,6 +157,11 @@ def sla_remaining_from_created(created_time, severity, settings):
 def notify_remaining_from_created(created_time, severity, settings):
     return remaining_minutes_from_created(created_time, settings.warning_at(severity))
 
+
+def customer_notification_remaining_from_created(created_time, severity, settings):
+    return remaining_minutes_from_created(created_time, settings.notification_for(severity))
+
+
 def clamp_int(v, default, lo, hi):
     try: x = int(v)
     except Exception: x = default
@@ -260,11 +265,33 @@ class Storage:
 
 @dataclass
 class RuntimeSettings:
-    scan_interval_seconds:int=45; sla_warning_percent:int=60; sla_high_minutes:int=60; sla_medium_minutes:int=240; sla_low_minutes:int=240; sla_informational_minutes:int=480; repeat_notification_minutes:int=10; auto_fetch_interval_seconds:int=20; my_owner_identity:str=''
+    # Taking Charge Time KPI: time to take ownership/assign the incident.
+    scan_interval_seconds:int=45
+    sla_critical_minutes:int=30; sla_high_minutes:int=30; sla_medium_minutes:int=60; sla_low_minutes:int=60; sla_informational_minutes:int=60
+
+    # Notification Time KPI: customer/user notification timing. Popup notifications are based on this KPI.
+    notification_critical_minutes:int=30; notification_high_minutes:int=60; notification_medium_minutes:int=240; notification_low_minutes:int=480; notification_informational_minutes:int=480
+
+    repeat_notification_minutes:int=10; auto_fetch_interval_seconds:int=20; my_owner_identity:str=''
+
+    def severity_key(self, sev):
+        s=(sev or '').strip().lower()
+        if s in ['critical','high','medium','low','informational']:
+            return s
+        return 'medium'
+
     def sla_for(self, sev):
-        s=(sev or '').lower()
-        return self.sla_high_minutes if s=='high' else self.sla_medium_minutes if s=='medium' else self.sla_low_minutes if s=='low' else self.sla_informational_minutes if s=='informational' else self.sla_medium_minutes
-    def warning_at(self, sev): return max(1, math.ceil(self.sla_for(sev)*self.sla_warning_percent/100))
+        # Backward-compatible name: this is Taking Charge SLA.
+        s=self.severity_key(sev)
+        return self.sla_critical_minutes if s=='critical' else self.sla_high_minutes if s=='high' else self.sla_medium_minutes if s=='medium' else self.sla_low_minutes if s=='low' else self.sla_informational_minutes
+
+    def notification_for(self, sev):
+        s=self.severity_key(sev)
+        return self.notification_critical_minutes if s=='critical' else self.notification_high_minutes if s=='high' else self.notification_medium_minutes if s=='medium' else self.notification_low_minutes if s=='low' else self.notification_informational_minutes
+
+    def warning_at(self, sev):
+        # Popup warning is now based directly on Notification Time KPI, not on % of Taking Charge.
+        return self.notification_for(sev)
 
 
 def sla_due_from_created(created_time: str, severity: str, settings: RuntimeSettings) -> str:
@@ -287,14 +314,18 @@ def sla_notify_from_created(created_time: str, severity: str, settings: RuntimeS
 def runtime_settings_from_storage(store):
     s = RuntimeSettings()
     saved = store.load_settings()
-    s.scan_interval_seconds = clamp_int(saved.get('scan_interval_seconds'), s.scan_interval_seconds, 10, 3600)
-    s.sla_warning_percent = clamp_int(saved.get('sla_warning_percent'), s.sla_warning_percent, 1, 100)
-    s.sla_high_minutes = clamp_int(saved.get('sla_high_minutes'), s.sla_high_minutes, 1, 10080)
-    s.sla_medium_minutes = clamp_int(saved.get('sla_medium_minutes'), s.sla_medium_minutes, 1, 10080)
-    s.sla_low_minutes = clamp_int(saved.get('sla_low_minutes'), s.sla_low_minutes, 1, 10080)
-    s.sla_informational_minutes = clamp_int(saved.get('sla_informational_minutes'), s.sla_informational_minutes, 1, 10080)
-    s.repeat_notification_minutes = clamp_int(saved.get('repeat_notification_minutes'), s.repeat_notification_minutes, 1, 1440)
-    s.auto_fetch_interval_seconds = clamp_int(saved.get('auto_fetch_interval_seconds'), s.auto_fetch_interval_seconds, 5, 3600)
+
+    for key in [
+        'scan_interval_seconds',
+        'sla_critical_minutes','sla_high_minutes','sla_medium_minutes','sla_low_minutes','sla_informational_minutes',
+        'notification_critical_minutes','notification_high_minutes','notification_medium_minutes','notification_low_minutes','notification_informational_minutes',
+        'repeat_notification_minutes','auto_fetch_interval_seconds'
+    ]:
+        if key in saved:
+            default = getattr(s, key)
+            lo, hi = (5, 3600) if key == 'auto_fetch_interval_seconds' else (10, 3600) if key == 'scan_interval_seconds' else (1, 10080)
+            setattr(s, key, clamp_int(saved.get(key), default, lo, hi))
+
     s.my_owner_identity = saved.get('my_owner_identity', '') or ''
     return s
 
@@ -331,7 +362,7 @@ class SentinelPageBot:
     def parse_row_identity(self, txt):
         text = normalize_text(txt)
         severity = ''
-        for sev in ['High', 'Medium', 'Low', 'Informational']:
+        for sev in ['Critical', 'High', 'Medium', 'Low', 'Informational']:
             if re.search(rf"\b{sev}\b", text, re.I):
                 severity = sev
                 break
@@ -339,7 +370,7 @@ class SentinelPageBot:
         # Typical Sentinel row:
         # Informational 18831 Multi-stage incident ...
         m = re.search(
-            r"\b(High|Medium|Low|Informational)\b\s+(\d{3,})\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{1,2}/\d{1,2}/\d{2,4})",
+            r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{1,2}/\d{1,2}/\d{2,4})",
             text,
             re.I
         )
@@ -483,14 +514,14 @@ class SentinelPageBot:
         else:
             owner = self.near_label(lines, 'Owner') or 'Unknown'
 
-        for sev in ['High', 'Medium', 'Low', 'Informational']:
+        for sev in ['Critical', 'High', 'Medium', 'Low', 'Informational']:
             if re.search(rf"\b{sev}\b\s+Severity\b", compact, re.I) or re.search(rf"\bSeverity\b\s+{sev}\b", compact, re.I):
                 severity = sev
                 break
 
         if not severity:
             n = self.near_label(lines, 'Severity')
-            severity = n.title() if n.title() in ['High', 'Medium', 'Low', 'Informational'] else ''
+            severity = n.title() if n.title() in ['Critical', 'High', 'Medium', 'Low', 'Informational'] else ''
 
         for i, line in enumerate(lines):
             if line.lower() == 'creation time' and i + 1 < len(lines):
@@ -1173,15 +1204,18 @@ class BotWorker(threading.Thread):
         return page
     def settings_dict(self): return self.settings.__dict__.copy()
     def update_settings(self, vals):
-        self.settings.scan_interval_seconds=clamp_int(vals.get('scan_interval_seconds'),45,10,3600)
-        self.settings.sla_warning_percent=clamp_int(vals.get('sla_warning_percent'),60,1,100)
-        self.settings.sla_high_minutes=clamp_int(vals.get('sla_high_minutes'),60,1,10080)
-        self.settings.sla_medium_minutes=clamp_int(vals.get('sla_medium_minutes'),240,1,10080)
-        self.settings.sla_low_minutes=clamp_int(vals.get('sla_low_minutes'),240,1,10080)
-        self.settings.sla_informational_minutes=clamp_int(vals.get('sla_informational_minutes'),480,1,10080)
-        self.settings.repeat_notification_minutes=clamp_int(vals.get('repeat_notification_minutes'),10,1,1440)
-        self.settings.auto_fetch_interval_seconds=clamp_int(vals.get('auto_fetch_interval_seconds'),20,5,3600)
-        self.store.save_settings(self.settings_dict()); self.emit('status', {'message':'SLA settings saved','settings':self.settings_dict()})
+        int_fields = [
+            'scan_interval_seconds',
+            'sla_critical_minutes','sla_high_minutes','sla_medium_minutes','sla_low_minutes','sla_informational_minutes',
+            'notification_critical_minutes','notification_high_minutes','notification_medium_minutes','notification_low_minutes','notification_informational_minutes',
+            'repeat_notification_minutes','auto_fetch_interval_seconds'
+        ]
+        for key in int_fields:
+            default = getattr(self.settings, key)
+            lo, hi = (5, 3600) if key == 'auto_fetch_interval_seconds' else (10, 3600) if key == 'scan_interval_seconds' else (1, 10080)
+            setattr(self.settings, key, clamp_int(vals.get(key), default, lo, hi))
+
+        self.store.save_settings(self.settings_dict()); self.emit('status', {'message':'Taking Charge / Notification SLA settings saved','settings':self.settings_dict()})
     def check_sla(self):
         """
         SLA notification is based on Created time, matching the dashboard remaining-minutes columns.
@@ -1216,8 +1250,8 @@ class BotWorker(threading.Thread):
                 nt = 'Sentinel SLA BREACH'
                 label = 'breached'
             else:
-                nt = f'Sentinel SLA {self.settings.sla_warning_percent}% reached'
-                label = f'reached {self.settings.sla_warning_percent}%'
+                nt = 'Sentinel Notification Time reached'
+                label = 'notification time reached'
 
             message = f'Incident {key} {label}: {age}/{sla} min ({sev}). {title}'
 
@@ -1352,14 +1386,28 @@ class BotApp(tk.Tk):
         ]: ttk.Button(ctr,text=text,command=cmd).pack(side='left',padx=(0,6))
         self.status_var=tk.StringVar(value='Ready'); ttk.Label(ctr,textvariable=self.status_var,foreground='#0f172a').pack(side='left',padx=(16,0))
         sla=ttk.LabelFrame(root,text='3) SLA settings',padding=10); sla.pack(fill='x',pady=(0,8))
-        self.sla_vars={'sla_high_minutes':tk.IntVar(value=60),'sla_medium_minutes':tk.IntVar(value=240),'sla_low_minutes':tk.IntVar(value=240),'sla_informational_minutes':tk.IntVar(value=480),'sla_warning_percent':tk.IntVar(value=60),'scan_interval_seconds':tk.IntVar(value=45),'repeat_notification_minutes':tk.IntVar(value=10),'auto_fetch_interval_seconds':tk.IntVar(value=20)}
-        for label,key in [('High SLA min','sla_high_minutes'),('Medium SLA min','sla_medium_minutes'),('Low SLA min','sla_low_minutes'),('Info SLA min','sla_informational_minutes'),('Notify at %','sla_warning_percent'),('Scan sec','scan_interval_seconds'),('Repeat notif min','repeat_notification_minutes'),('Auto fetch sec','auto_fetch_interval_seconds')]: ttk.Label(sla,text=label).pack(side='left',padx=(0,4)); ttk.Spinbox(sla,from_=1,to=10080,textvariable=self.sla_vars[key],width=7).pack(side='left',padx=(0,12))
+        self.sla_vars={
+            'sla_critical_minutes':tk.IntVar(value=30),'sla_high_minutes':tk.IntVar(value=30),'sla_medium_minutes':tk.IntVar(value=60),'sla_low_minutes':tk.IntVar(value=60),'sla_informational_minutes':tk.IntVar(value=60),
+            'notification_critical_minutes':tk.IntVar(value=30),'notification_high_minutes':tk.IntVar(value=60),'notification_medium_minutes':tk.IntVar(value=240),'notification_low_minutes':tk.IntVar(value=480),'notification_informational_minutes':tk.IntVar(value=480),
+            'scan_interval_seconds':tk.IntVar(value=45),'repeat_notification_minutes':tk.IntVar(value=10),'auto_fetch_interval_seconds':tk.IntVar(value=20)
+        }
+
+        kpi_rows=[
+            ('Taking Charge', [('Crit','sla_critical_minutes'),('High','sla_high_minutes'),('Med','sla_medium_minutes'),('Low','sla_low_minutes'),('Info','sla_informational_minutes')]),
+            ('Notification', [('Crit','notification_critical_minutes'),('High','notification_high_minutes'),('Med','notification_medium_minutes'),('Low','notification_low_minutes'),('Info','notification_informational_minutes')]),
+            ('Bot', [('Scan sec','scan_interval_seconds'),('Repeat min','repeat_notification_minutes'),('Auto fetch','auto_fetch_interval_seconds')])
+        ]
+        for row_name, fields in kpi_rows:
+            ttk.Label(sla,text=row_name+':').pack(side='left',padx=(8,4))
+            for label,key in fields:
+                ttk.Label(sla,text=label).pack(side='left',padx=(0,2))
+                ttk.Spinbox(sla,from_=1,to=10080,textvariable=self.sla_vars[key],width=5).pack(side='left',padx=(0,6))
         ttk.Button(sla,text='SAVE SLA SETTINGS',command=self.save_sla).pack(side='left',padx=(8,0))
         tabs=ttk.Notebook(root); tabs.pack(fill='both',expand=True); f1=ttk.Frame(tabs,padding=6); f2=ttk.Frame(tabs,padding=6); tabs.add(f1,text='Incidents seen by bot'); tabs.add(f2,text='Actions / logs')
-        self.inc_tree=ttk.Treeview(f1,columns=('incident','severity','status','owner','title','created','notify_remaining','sla_remaining','last_notified','last_update','active_since','age','sla','workspace'),show='headings')
-        for col,w in [('incident',90),('severity',100),('status',90),('owner',130),('title',360),('created',170),('notify_remaining',150),('sla_remaining',150),('last_notified',170),('last_update',170),('active_since',170),('age',80),('sla',180),('workspace',180)]: self.inc_tree.heading(col,text=col.replace('_',' ').title()); self.inc_tree.column(col,width=w,anchor='w')
-        self.inc_tree.heading('notify_remaining', text='Min To Notify')
-        self.inc_tree.heading('sla_remaining', text='Min To SLA')
+        self.inc_tree=ttk.Treeview(f1,columns=('incident','severity','status','owner','title','created','taking_charge_remaining','customer_notify_remaining','last_notified','last_update','active_since','age','workspace'),show='headings')
+        for col,w in [('incident',90),('severity',100),('status',90),('owner',130),('title',360),('created',150),('taking_charge_remaining',160),('customer_notify_remaining',160),('last_notified',120),('last_update',150),('active_since',150),('age',80),('workspace',180)]: self.inc_tree.heading(col,text=col.replace('_',' ').title()); self.inc_tree.column(col,width=w,anchor='w')
+        self.inc_tree.heading('taking_charge_remaining', text='Min To Taking Charge')
+        self.inc_tree.heading('customer_notify_remaining', text='Min To Notify')
         self.inc_tree.heading('last_notified', text='Last Notified')
         self.inc_tree.pack(fill='both',expand=True)
         self.act_tree=ttk.Treeview(f2,columns=('ts','incident','action','result','details'),show='headings')
@@ -1478,7 +1526,7 @@ class BotApp(tk.Tk):
         self.inc_tree.delete(*self.inc_tree.get_children())
         for inc in incs:
             age,sla=self.sla_view(inc); ref=inc.get('activated_at') or inc.get('first_seen_active') or ''
-            self.inc_tree.insert('', 'end', values=(inc.get('incident_key',''),inc.get('severity',''),inc.get('status',''),inc.get('owner',''),inc.get('title',''),inc.get('created_time',''),format_remaining_minutes(notify_remaining_from_created(inc.get('created_time',''), inc.get('severity',''), RuntimeSettings(sla_high_minutes=self.sla_vars['sla_high_minutes'].get(), sla_medium_minutes=self.sla_vars['sla_medium_minutes'].get(), sla_low_minutes=self.sla_vars['sla_low_minutes'].get(), sla_informational_minutes=self.sla_vars['sla_informational_minutes'].get(), sla_warning_percent=self.sla_vars['sla_warning_percent'].get()))),format_remaining_minutes(sla_remaining_from_created(inc.get('created_time',''), inc.get('severity',''), RuntimeSettings(sla_high_minutes=self.sla_vars['sla_high_minutes'].get(), sla_medium_minutes=self.sla_vars['sla_medium_minutes'].get(), sla_low_minutes=self.sla_vars['sla_low_minutes'].get(), sla_informational_minutes=self.sla_vars['sla_informational_minutes'].get(), sla_warning_percent=self.sla_vars['sla_warning_percent'].get()))),format_time_only(inc.get('last_sla_warning_at','')),inc.get('last_update_time',''),ref,age,sla,inc.get('workspace_hint','')))
+            self.inc_tree.insert('', 'end', values=(inc.get('incident_key',''),inc.get('severity',''),inc.get('status',''),inc.get('owner',''),inc.get('title',''),inc.get('created_time',''),format_remaining_minutes(sla_remaining_from_created(inc.get('created_time',''), inc.get('severity',''), RuntimeSettings(sla_critical_minutes=self.sla_vars['sla_critical_minutes'].get(), sla_high_minutes=self.sla_vars['sla_high_minutes'].get(), sla_medium_minutes=self.sla_vars['sla_medium_minutes'].get(), sla_low_minutes=self.sla_vars['sla_low_minutes'].get(), sla_informational_minutes=self.sla_vars['sla_informational_minutes'].get()))),format_remaining_minutes(customer_notification_remaining_from_created(inc.get('created_time',''), inc.get('severity',''), RuntimeSettings(notification_critical_minutes=self.sla_vars['notification_critical_minutes'].get(), notification_high_minutes=self.sla_vars['notification_high_minutes'].get(), notification_medium_minutes=self.sla_vars['notification_medium_minutes'].get(), notification_low_minutes=self.sla_vars['notification_low_minutes'].get(), notification_informational_minutes=self.sla_vars['notification_informational_minutes'].get()))),format_time_only(inc.get('last_sla_warning_at','')),inc.get('last_update_time',''),ref,age,inc.get('workspace_hint','')))
     def refresh_actions(self,acts):
         self.act_tree.delete(*self.act_tree.get_children())
         for a in acts: self.act_tree.insert('', 'end', values=(a.get('ts',''),a.get('incident_key',''),a.get('action',''),a.get('result',''),a.get('details','')))
