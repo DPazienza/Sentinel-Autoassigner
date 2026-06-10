@@ -1,5 +1,0 @@
-Sentinel Auto Assign Bot - Final Clean
-Mode: Desktop app
-Browser: Chrome / Edge
-API usage: none
-SLA model: Taking Charge + Notification

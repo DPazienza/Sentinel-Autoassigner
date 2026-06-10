@@ -234,20 +234,15 @@ class Storage:
                 workspace_hint=COALESCE(NULLIF(excluded.workspace_hint,''),incidents.workspace_hint), source_page=COALESCE(NULLIF(excluded.source_page,''),incidents.source_page)''',
                 (key,title,severity,created,last_update,ts,ts,ts,workspace,source))
     def sync_visible_incidents(self, visible_keys):
-        """
-        Keep dashboard aligned with the current Sentinel grid.
-        Incidents not visible anymore, for example because they were closed or filtered out,
-        are removed from the dashboard local state.
-        """
         keys = [str(k) for k in visible_keys if k]
+        if not keys:
+            return
         with self.connect() as con:
-            if not keys:
-                con.execute("DELETE FROM incidents")
-                return
-            placeholders = ",".join(["?"] * len(keys))
+            placeholders = ','.join(['?'] * len(keys))
             con.execute(f"DELETE FROM incidents WHERE incident_key NOT IN ({placeholders})", keys)
 
     def incidents(self, limit=500):
+
         with self.connect() as con:
             con.row_factory = sqlite3.Row
             return [dict(r) for r in con.execute("SELECT * FROM incidents ORDER BY last_seen DESC LIMIT ?", (limit,)).fetchall()]
@@ -879,26 +874,15 @@ class SentinelPageBot:
         return re.sub(r"\s+", " ", (owner or "").strip()).lower()
 
     def owner_is_me(self, owner):
-        """
-        Safe rule:
-        - If owner is Unassigned -> handled separately.
-        - If we have learned the current user's Owner display text from a successful Assign to me,
-          we allow status changes only when the current owner matches that identity.
-        - If we do not know the identity yet, assigned owners are treated as other users and skipped.
-        """
         owner_norm = self.normalize_owner_text(owner)
         known_me = self.normalize_owner_text(getattr(self.settings, 'my_owner_identity', ''))
-
         if not owner_norm or owner_norm in ['unknown', '-']:
             return False
-
         if self.owner_is_unassigned(owner):
             return False
-
-        if known_me and (owner_norm == known_me or known_me in owner_norm or owner_norm in known_me):
-            return True
-
-        return False
+        if not known_me:
+            return False
+        return owner_norm == known_me
 
     def owner_is_unassigned(self, owner):
         owner_l = (owner or '').lower()
@@ -1175,8 +1159,26 @@ class SentinelPageBot:
 
 class BotWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.running_bot=False; self.paused=False; self.dry_run=True; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0
+        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.running_bot=False; self.paused=False; self.dry_run=True; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
+    def set_runtime_state(self, **changes):
+        with self.state_lock:
+            for key, value in changes.items():
+                setattr(self, key, value)
+
+    def get_runtime_state(self):
+        with self.state_lock:
+            return {
+                'running_bot': self.running_bot,
+                'paused': self.paused,
+                'dry_run': self.dry_run,
+                'last_scan_ts': self.last_scan_ts,
+            }
+
+    def can_continue_flag(self):
+        with self.state_lock:
+            return self.running_bot and not self.paused
+
     def connect_browsers(self):
         if self.playwright is None: self.playwright=sync_playwright().start()
         self.pages={}; self.browsers=[]; connected=[]
@@ -1217,45 +1219,26 @@ class BotWorker(threading.Thread):
 
         self.store.save_settings(self.settings_dict()); self.emit('status', {'message':'Taking Charge / Notification SLA settings saved','settings':self.settings_dict()})
     def check_sla(self):
-        """
-        SLA notification is based on Created time, matching the dashboard remaining-minutes columns.
-        It checks all non-closed incidents seen by the bot, not only Active ones.
-        """
         warnings = 0
         for inc in self.store.incidents():
             status = (inc.get('status') or '').lower()
             if status == 'closed':
                 continue
-
             created = inc.get('created_time') or ''
             age = created_age_minutes(created)
             if age is None:
                 continue
-
             sev = inc.get('severity') or 'Medium'
-            sla = self.settings.sla_for(sev)
-            warn = self.settings.warning_at(sev)
-
-            if age < warn:
+            notify_due = self.settings.notification_for(sev)
+            if age < notify_due:
                 continue
-
             last_minutes = minutes_since_timestamp(inc.get('last_sla_warning_at'))
             if last_minutes is not None and last_minutes < self.settings.repeat_notification_minutes:
                 continue
-
             key = inc.get('incident_key') or '-'
             title = inc.get('title') or '-'
-
-            if age >= sla:
-                nt = 'Sentinel SLA BREACH'
-                label = 'breached'
-            else:
-                nt = 'Sentinel Notification Time reached'
-                label = 'notification time reached'
-
-            message = f'Incident {key} {label}: {age}/{sla} min ({sev}). {title}'
-
-            # Windows toast/beep + persistent app popup handled by UI thread.
+            nt = 'Sentinel Notification Time reached'
+            message = f'Incident {key} reached Notification Time: {age}/{notify_due} min ({sev}). {title}'
             notify_windows(nt, message)
             self.emit('sla_alert', {
                 'title': nt,
@@ -1264,29 +1247,30 @@ class BotWorker(threading.Thread):
                 'incident_title': title,
                 'severity': sev,
                 'age': age,
-                'sla': sla,
-                'warning_at': warn,
+                'sla': notify_due,
+                'warning_at': notify_due,
             })
-
             self.store.mark_sla_warning(key)
-            self.store.log_action(
-                key, title, 'SLA_WARNING', 'SENT',
-                f'age={age}, sla={sla}, warning_at={warn}, severity={sev}, created={created}'
-            )
+            self.store.log_action(key, title, 'SLA_NOTIFICATION', 'SENT', f'age={age}, notification_due={notify_due}, severity={sev}, created={created}')
             warnings += 1
         return warnings
     def run_scan(self, fetch_only=False):
-        page=self.selected_page(); bot=SentinelPageBot(page,self.store,self.settings); bot.can_continue=(lambda: True) if fetch_only else (lambda: self.running_bot and not self.paused); scanned,processed=bot.scan(self.dry_run,fetch_only); warnings=self.check_sla()
+        page = self.selected_page()
+        state = self.get_runtime_state()
+        bot = SentinelPageBot(page, self.store, self.settings)
+        bot.can_continue = (lambda: True) if fetch_only else self.can_continue_flag
+        scanned, processed = bot.scan(state['dry_run'], fetch_only)
+        warnings = self.check_sla()
         self.emit('scan_result', {'scanned':scanned,'processed':processed,'warnings':warnings,'fetch_only':fetch_only,'incidents':self.store.incidents(),'actions':self.store.actions(),'settings':self.settings_dict(),'target_url':page.url})
     def handle(self,cmd):
         a=cmd.get('action')
         if a=='refresh_pages': self.refresh_pages()
         elif a=='select_page': self.target_page_id=cmd.get('page_id'); self.emit('status',{'message':f'Selected page: {self.target_page_id}','settings':self.settings_dict()})
         elif a=='fetch': self.emit('status',{'message':'Fetching selected Sentinel tab without refreshing page...','settings':self.settings_dict()}); self.run_scan(fetch_only=True); self.last_fetch_ts=time.time()
-        elif a=='start': self.dry_run=bool(cmd.get('dry_run',True)); self.running_bot=True; self.paused=False; self.last_scan_ts=0; self.emit('status',{'message':'Bot started in '+('dry-run' if self.dry_run else 'real')+' mode','settings':self.settings_dict()})
-        elif a=='pause': self.paused=True; self.emit('status',{'message':'Bot paused','settings':self.settings_dict()})
-        elif a=='resume': self.paused=False; self.emit('status',{'message':'Bot resumed','settings':self.settings_dict()})
-        elif a=='stop': self.running_bot=False; self.paused=False; self.emit('status',{'message':'Bot stopped','settings':self.settings_dict()})
+        elif a=='start': self.set_runtime_state(dry_run=bool(cmd.get('dry_run',True)), running_bot=True, paused=False, last_scan_ts=0); self.emit('status',{'message':'Bot started in '+('dry-run' if bool(cmd.get('dry_run',True)) else 'real')+' mode','settings':self.settings_dict()})
+        elif a=='pause': self.set_runtime_state(paused=True); self.emit('status',{'message':'Bot paused','settings':self.settings_dict()})
+        elif a=='resume': self.set_runtime_state(paused=False, running_bot=True); self.emit('status',{'message':'Bot resumed','settings':self.settings_dict()})
+        elif a=='stop': self.set_runtime_state(running_bot=False, paused=False); self.emit('status',{'message':'Bot stopped','settings':self.settings_dict()})
         elif a=='settings': self.update_settings(cmd.get('values',{}))
     def run(self):
         self.emit('status', {'message':'Worker ready. Click Launch Chrome/Edge for bot: the app will open and auto-link the new tab.','settings':self.settings_dict()})
@@ -1296,7 +1280,8 @@ class BotWorker(threading.Thread):
                 except queue.Empty: pass
                 # Auto-fetch non invasivo: aggiorna la dashboard leggendo la vista corrente senza ricaricare la pagina.
                 # Parte solo quando il bot reale/dry-run non è in esecuzione, così non interferisce con le azioni automatiche.
-                if (not self.running_bot) and (not self.paused) and self.target_page_id and time.time()-self.last_fetch_ts>=self.settings.auto_fetch_interval_seconds:
+                state = self.get_runtime_state()
+                if (not state['running_bot']) and (not state['paused']) and self.target_page_id and time.time()-self.last_fetch_ts>=self.settings.auto_fetch_interval_seconds:
                     self.last_fetch_ts=time.time()
                     try:
                         self.emit('status',{'message':'Auto-fetch current Sentinel view...', 'settings':self.settings_dict()})
@@ -1305,8 +1290,9 @@ class BotWorker(threading.Thread):
                         # Evita popup continui: l'errore viene mostrato nello status, non come messagebox ripetuto.
                         self.emit('status',{'message':'Auto-fetch skipped: '+str(e), 'settings':self.settings_dict()})
 
-                if self.running_bot and not self.paused and self.target_page_id and time.time()-self.last_scan_ts>=self.settings.scan_interval_seconds:
-                    self.last_scan_ts=time.time()
+                state = self.get_runtime_state()
+                if state['running_bot'] and not state['paused'] and self.target_page_id and time.time()-state['last_scan_ts']>=self.settings.scan_interval_seconds:
+                    self.set_runtime_state(last_scan_ts=time.time())
                     try: self.emit('status',{'message':'Automatic scan running...','settings':self.settings_dict()}); self.run_scan(False)
                     except Exception as e: self.emit('error',{'message':str(e)})
             except Exception as e: self.emit('error',{'message':str(e)})
@@ -1391,18 +1377,21 @@ class BotApp(tk.Tk):
             'notification_critical_minutes':tk.IntVar(value=30),'notification_high_minutes':tk.IntVar(value=60),'notification_medium_minutes':tk.IntVar(value=240),'notification_low_minutes':tk.IntVar(value=480),'notification_informational_minutes':tk.IntVar(value=480),
             'scan_interval_seconds':tk.IntVar(value=45),'repeat_notification_minutes':tk.IntVar(value=10),'auto_fetch_interval_seconds':tk.IntVar(value=20)
         }
-
-        kpi_rows=[
-            ('Taking Charge', [('Crit','sla_critical_minutes'),('High','sla_high_minutes'),('Med','sla_medium_minutes'),('Low','sla_low_minutes'),('Info','sla_informational_minutes')]),
-            ('Notification', [('Crit','notification_critical_minutes'),('High','notification_high_minutes'),('Med','notification_medium_minutes'),('Low','notification_low_minutes'),('Info','notification_informational_minutes')]),
-            ('Bot', [('Scan sec','scan_interval_seconds'),('Repeat min','repeat_notification_minutes'),('Auto fetch','auto_fetch_interval_seconds')])
+        sla_grid = ttk.Frame(sla); sla_grid.pack(fill='x')
+        headers = ['', 'Critical', 'High', 'Medium', 'Low', 'Info']
+        for c, h in enumerate(headers): ttk.Label(sla_grid, text=h, font=('Segoe UI', 9, 'bold')).grid(row=0, column=c, padx=4, pady=2, sticky='w')
+        kpi_rows = [
+            ('Taking Charge', ['sla_critical_minutes','sla_high_minutes','sla_medium_minutes','sla_low_minutes','sla_informational_minutes']),
+            ('Notification', ['notification_critical_minutes','notification_high_minutes','notification_medium_minutes','notification_low_minutes','notification_informational_minutes']),
         ]
-        for row_name, fields in kpi_rows:
-            ttk.Label(sla,text=row_name+':').pack(side='left',padx=(8,4))
-            for label,key in fields:
-                ttk.Label(sla,text=label).pack(side='left',padx=(0,2))
-                ttk.Spinbox(sla,from_=1,to=10080,textvariable=self.sla_vars[key],width=5).pack(side='left',padx=(0,6))
-        ttk.Button(sla,text='SAVE SLA SETTINGS',command=self.save_sla).pack(side='left',padx=(8,0))
+        for r, (row_name, keys) in enumerate(kpi_rows, start=1):
+            ttk.Label(sla_grid, text=row_name).grid(row=r, column=0, padx=4, pady=2, sticky='w')
+            for c, key in enumerate(keys, start=1): ttk.Spinbox(sla_grid, from_=1, to=10080, textvariable=self.sla_vars[key], width=7).grid(row=r, column=c, padx=4, pady=2, sticky='w')
+        bot_grid = ttk.Frame(sla); bot_grid.pack(fill='x', pady=(8,0))
+        for c, (label, key) in enumerate([('Scan sec','scan_interval_seconds'),('Repeat notif min','repeat_notification_minutes'),('Auto fetch sec','auto_fetch_interval_seconds')]):
+            ttk.Label(bot_grid, text=label).grid(row=0, column=c*2, padx=(4,2), pady=2, sticky='w')
+            ttk.Spinbox(bot_grid, from_=1, to=10080, textvariable=self.sla_vars[key], width=7).grid(row=0, column=c*2+1, padx=(0,12), pady=2, sticky='w')
+        ttk.Button(bot_grid,text='SAVE SLA SETTINGS',command=self.save_sla).grid(row=0, column=8, padx=(8,0), pady=2, sticky='w')
         tabs=ttk.Notebook(root); tabs.pack(fill='both',expand=True); f1=ttk.Frame(tabs,padding=6); f2=ttk.Frame(tabs,padding=6); tabs.add(f1,text='Incidents seen by bot'); tabs.add(f2,text='Actions / logs')
         self.inc_tree=ttk.Treeview(f1,columns=('incident','severity','status','owner','title','created','taking_charge_remaining','customer_notify_remaining','last_notified','last_update','active_since','age','workspace'),show='headings')
         for col,w in [('incident',90),('severity',100),('status',90),('owner',130),('title',360),('created',150),('taking_charge_remaining',160),('customer_notify_remaining',160),('last_notified',120),('last_update',150),('active_since',150),('age',80),('workspace',180)]: self.inc_tree.heading(col,text=col.replace('_',' ').title()); self.inc_tree.column(col,width=w,anchor='w')
@@ -1444,30 +1433,22 @@ class BotApp(tk.Tk):
 
 
     def start_bot(self, dry_run):
-        # Aggiorna subito i flag locali del worker, senza aspettare che la coda venga processata.
-        self.worker.dry_run = bool(dry_run)
-        self.worker.running_bot = True
-        self.worker.paused = False
-        self.worker.last_scan_ts = 0
+        self.worker.set_runtime_state(dry_run=bool(dry_run), running_bot=True, paused=False, last_scan_ts=0)
         self.status_var.set('Bot started in ' + ('dry-run' if dry_run else 'real') + ' mode')
         self.send('start', dry_run=dry_run)
 
     def pause_bot(self):
-        # Effetto immediato: il ciclo interrompe prima del prossimo incident.
-        self.worker.paused = True
+        self.worker.set_runtime_state(paused=True)
         self.status_var.set('Bot paused')
         self.send('pause')
 
     def resume_bot(self):
-        self.worker.paused = False
-        self.worker.running_bot = True
+        self.worker.set_runtime_state(paused=False, running_bot=True)
         self.status_var.set('Bot resumed')
         self.send('resume')
 
     def stop_bot(self):
-        # Effetto immediato: il ciclo interrompe prima del prossimo incident.
-        self.worker.running_bot = False
-        self.worker.paused = False
+        self.worker.set_runtime_state(running_bot=False, paused=False)
         self.status_var.set('Bot stopped')
         self.send('stop')
 
@@ -1514,15 +1495,15 @@ class BotApp(tk.Tk):
                 else:
                     self.status_var.set(f"Impossibile collegare automaticamente {self.pending_auto_browser}. Premi Refresh browser tabs.")
                     self.pending_auto_browser=None
-    def sla_view(self,inc):
-        sev=(inc.get('severity') or 'Medium').lower(); sla=self.sla_vars['sla_high_minutes'].get() if sev=='high' else self.sla_vars['sla_medium_minutes'].get() if sev=='medium' else self.sla_vars['sla_low_minutes'].get() if sev=='low' else self.sla_vars['sla_informational_minutes'].get() if sev=='informational' else self.sla_vars['sla_medium_minutes'].get()
-        warn=max(1,math.ceil(sla*self.sla_vars['sla_warning_percent'].get()/100)); ref=inc.get('activated_at') or inc.get('first_seen_active'); dt=parse_iso(ref)
-        if not dt: return '-','-'
-        age=int((now_utc()-dt).total_seconds()//60)
-        if age>=sla: return f'{age} min', f'BREACH {age}/{sla}'
-        if age>=warn: return f'{age} min', f"WARNING {age}/{sla} ({self.sla_vars['sla_warning_percent'].get()}%)"
-        return f'{age} min', f'OK {age}/{sla}'
+    def sla_view(self, inc):
+        created = inc.get('created_time') or ''
+        age_min = created_age_minutes(created)
+        if age_min is None:
+            return '-', '-'
+        return f'{age_min} min', '-'
+
     def refresh_incidents(self,incs):
+
         self.inc_tree.delete(*self.inc_tree.get_children())
         for inc in incs:
             age,sla=self.sla_view(inc); ref=inc.get('activated_at') or inc.get('first_seen_active') or ''
@@ -1530,7 +1511,7 @@ class BotApp(tk.Tk):
     def refresh_actions(self,acts):
         self.act_tree.delete(*self.act_tree.get_children())
         for a in acts: self.act_tree.insert('', 'end', values=(a.get('ts',''),a.get('incident_key',''),a.get('action',''),a.get('result',''),a.get('details','')))
-    def show_sla_popup(self, title, message):
+    def show_sla_popup(self, title, message, severity='Medium'):
         """
         Persistent topmost popup: it closes only when the user clicks ACKNOWLEDGE.
         """
@@ -1545,7 +1526,9 @@ class BotApp(tk.Tk):
             frame = ttk.Frame(popup, padding=16)
             frame.pack(fill='both', expand=True)
 
-            ttk.Label(frame, text=title, font=('Segoe UI', 13, 'bold'), foreground='#b91c1c').pack(anchor='w', pady=(0, 10))
+            sev = (severity or '').lower()
+            color = '#7f1d1d' if sev == 'critical' else '#b91c1c' if sev == 'high' else '#b45309' if sev == 'medium' else '#0369a1'
+            ttk.Label(frame, text=title, font=('Segoe UI', 13, 'bold'), foreground=color).pack(anchor='w', pady=(0, 10))
             ttk.Label(frame, text=message, wraplength=480, justify='left').pack(anchor='w', fill='x', pady=(0, 14))
 
             ttk.Button(frame, text='ACKNOWLEDGE', command=popup.destroy).pack(anchor='e')
@@ -1572,7 +1555,7 @@ class BotApp(tk.Tk):
                         self.status_var.set('Browser connected: '+(', '.join(msg.get('connected',[])) or 'none')+'. Select the Sentinel tab.')
                 elif kind=='status': self.status_var.set(msg.get('message','')); self.apply_settings(msg.get('settings',{}))
                 elif kind=='scan_result': self.status_var.set(f"Scan done. Seen={msg.get('scanned')}, processed={msg.get('processed')}, SLA notifications={msg.get('warnings')}"); self.refresh_incidents(msg.get('incidents',[])); self.refresh_actions(msg.get('actions',[])); self.apply_settings(msg.get('settings',{}))
-                elif kind=='sla_alert': self.show_sla_popup(msg.get('title','SLA warning'), msg.get('message',''))
+                elif kind=='sla_alert': self.show_sla_popup(msg.get('title','SLA warning'), msg.get('message',''), msg.get('severity','Medium'))
                 elif kind=='error': self.status_var.set('ERROR: '+msg.get('message','')); messagebox.showwarning('Bot error', msg.get('message','Unknown error'))
         except queue.Empty: pass
         self.after(700,self.poll_worker)
