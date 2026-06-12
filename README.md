@@ -1,38 +1,18 @@
 # Sentinel Auto Assign Bot - Desktop App
 
-Applicazione desktop Windows per supportare la presa in carico degli incident Microsoft Sentinel usando la pagina web del portale Azure, senza API Sentinel/Azure.
+Applicazione desktop Windows per supportare la presa in carico degli incident Microsoft Sentinel dalla pagina web del portale Azure, senza usare API Sentinel/Azure.
 
-Il bot si collega a una tab Sentinel già aperta su Chrome o Edge, legge gli incident visibili nella vista corrente, assegna all'utente corrente gli incident non assegnati e monitora i KPI operativi configurati.
-
----
-
-## 1. Scopo dell'app
-
-Funzioni principali:
-
-```text
-- lettura degli incident visibili nella pagina Sentinel Incidents
-- dashboard locale degli incident letti
-- assegnazione automatica degli incident Unassigned
-- cambio Status da New ad Active solo per incident assegnati a te
-- skip degli incident assegnati ad altri utenti
-- monitoraggio Taking Charge Time
-- monitoraggio Notification Time
-- popup persistente quando viene raggiunto il Notification Time
-- salvataggio locale delle impostazioni
-```
+Il bot si collega a una tab Sentinel aperta su Chrome o Edge, legge gli incident visibili, assegna all'utente corrente gli incident non assegnati, porta in `Active` gli incident assegnati a te e monitora i KPI operativi.
 
 ---
 
-## 2. Requisiti
+## Requisiti
 
 ```text
 Windows
-Python 3.10 o superiore
+Python 3.10+
 Google Chrome oppure Microsoft Edge
 ```
-
-Firefox non è supportato.
 
 Durante l'installazione di Python abilita:
 
@@ -42,10 +22,10 @@ Add python.exe to PATH
 
 ---
 
-## 3. Installazione
+## Installazione
 
-1. Estrai lo ZIP in una cartella locale.
-2. Entra nella cartella estratta.
+1. Estrai lo ZIP.
+2. Apri la cartella estratta.
 3. Esegui:
 
 ```text
@@ -54,7 +34,7 @@ install_windows.bat
 
 ---
 
-## 4. Avvio
+## Avvio
 
 Uso normale:
 
@@ -62,21 +42,17 @@ Uso normale:
 run_desktop_app_windows.bat
 ```
 
-Uso con console di debug:
+Uso debug:
 
 ```text
 run_desktop_app_debug_console_windows.bat
 ```
 
-Reset dello stato locale:
-
-```text
-reset_local_state_windows.bat
-```
+Il debug lascia la console aperta e serve per vedere errori tecnici.
 
 ---
 
-## 5. Collegamento a Sentinel
+## Collegamento a Sentinel
 
 Procedura consigliata:
 
@@ -97,40 +73,28 @@ Il bot lavora solo sulla tab selezionata.
 
 ---
 
-## 6. Uso dei controlli
+## Controlli principali
 
 ### FETCH CURRENT VIEW NOW
 
-Legge la vista Sentinel corrente e aggiorna la dashboard. Non modifica Sentinel.
+Esegue una lettura manuale della vista Sentinel corrente.
+
+Non assegna nulla e non cambia status.
 
 ### START DRY-RUN
 
-Simula cosa farebbe il bot, senza modificare Owner o Status.
+Prima esegue un fetch iniziale, poi simula cosa farebbe il bot senza modificare Sentinel.
 
 ### START REAL BOT
 
-Avvia la modalità reale.
+Prima esegue un fetch iniziale, poi avvia il bot reale.
 
-Il bot può:
-
-```text
-- assegnare a te incident con Owner = Unassigned
-- mettere Active incident assegnati a te con Status = New
-```
-
-### PAUSE / RESUME / STOP
-
-Pausa, riprende o ferma il ciclo automatico.
-
----
-
-## 7. Logica Owner / Status
-
-Regola operativa:
+Logica:
 
 ```text
 Owner = Unassigned
     -> Assign to me
+    -> Apply
     -> verifica Owner
     -> se Status = New, imposta Active
 
@@ -143,17 +107,50 @@ Owner = altro utente
     -> non cambia Status
 ```
 
-Il bot impara il tuo Owner display name dopo un `Assign to me` riuscito e lo salva localmente.
+### PAUSE
 
-Il confronto Owner è stretto: il bot considera "me" solo un match esatto normalizzato con il nome salvato. Non usa match parziali.
+Mette in pausa il bot e disabilita l'auto-fetch.
+
+### RESUME
+
+Riprende il bot. L'auto-fetch resta disabilitato mentre il bot è in esecuzione.
+
+### STOP
+
+Ferma il bot e disabilita anche l'auto-fetch.
+
+Dopo STOP, per aggiornare la dashboard usa manualmente:
+
+```text
+FETCH CURRENT VIEW NOW
+```
 
 ---
 
-## 8. KPI gestiti
+## Auto-fetch e bot
+
+L'app evita che fetch e bot lavorino insieme sulla stessa tab.
+
+Regola:
+
+```text
+Auto-fetch attivo solo quando il bot è fermo
+Bot in avvio -> fetch iniziale completato prima del bot
+Bot running/paused -> auto-fetch disabilitato
+STOP -> bot fermo e auto-fetch disabilitato
+```
+
+Questo riduce errori dovuti a click o letture simultanee della stessa pagina Sentinel.
+
+---
+
+## KPI gestiti
 
 ### Taking Charge Time
 
-Serve per verificare entro quanto un incident viene preso in carico.
+Serve per misurare entro quanto un incident deve essere preso in carico.
+
+Default:
 
 ```text
 Critical: 30 min
@@ -165,7 +162,9 @@ Info:     60 min
 
 ### Notification Time
 
-Serve per decidere quando mostrare il popup persistente.
+Serve per il popup di notifica.
+
+Default:
 
 ```text
 Critical: 30 min
@@ -179,9 +178,9 @@ Il popup usa il Notification Time, non una percentuale del Taking Charge.
 
 ---
 
-## 9. Dashboard
+## Dashboard
 
-La tab `Incidents seen by bot` mostra:
+Colonne principali:
 
 ```text
 Incident
@@ -199,122 +198,134 @@ Age
 Workspace
 ```
 
-Valori `OVERDUE` indicano che il KPI è già superato.
+`OVERDUE X min` indica che il KPI è già superato.
 
 ---
 
-## 10. Notifiche
+## Log
 
-Quando un incident raggiunge il Notification Time, il bot mostra:
+L'app logga gli eventi in due posti.
 
-```text
-- popup persistente nell'app
-- notifica/beep Windows
-```
+### Log nella UI
 
-Il popup resta visibile finché non clicchi:
+Tab:
 
 ```text
-ACKNOWLEDGE
+Actions / logs
 ```
 
-La colonna `Last Notified` mostra solo ora e minuti:
-
-```text
-HH:MM
-```
-
----
-
-## 11. Log operativi
-
-La tab `Actions / logs` mostra le azioni registrate.
-
-Esempi:
+Mostra eventi come:
 
 ```text
 FETCH
-DRY_RUN
+SCAN
+BOT_START
+BOT_STOP
 ASSIGN_TO_ME
 SET_ACTIVE
 SKIP_OTHER_OWNER
 SLA_NOTIFICATION
+ERROR
+```
+
+### Log su file
+
+File:
+
+```text
+logs/app.log
+```
+
+Contiene errori tecnici, stack trace e problemi Playwright/browser.
+
+Se qualcosa si rompe, questo è il primo file da controllare.
+
+---
+
+## Perché su alcuni PC funziona meglio che su altri
+
+Il bot controlla una pagina web dinamica, quindi la stabilità dipende da vari fattori:
+
+```text
+versione Chrome/Edge
+zoom browser
+risoluzione schermo
+lingua UI Sentinel
+performance del PC
+latenza rete
+sessione Azure/MFA/PIM
+policy aziendali del browser
+estensioni browser
+aggiornamenti del portale Azure
+```
+
+Consigli:
+
+```text
+usa Chrome/Edge lanciato dal bottone dell'app
+evita zoom strani se possibile
+non usare la stessa tab manualmente mentre il bot lavora
+aspetta che Sentinel abbia caricato completamente la tab Incidents
+usa START DRY-RUN prima della modalità reale
 ```
 
 ---
 
-## 12. Stato locale
+## Errore EPIPE / Playwright / Node
 
-L'app salva lo stato in:
+Un errore tipo:
 
 ```text
-data/bot_state.sqlite3
+Error: EPIPE: broken pipe, write
 ```
 
-Contiene incident letti, azioni/log, configurazioni KPI, timestamp notifiche e Owner display name dell'utente.
+indica che il canale tra Python, Playwright/Node e il browser si è rotto.
+
+Può accadere se:
+
+```text
+il browser viene chiuso mentre il bot lo controlla
+la tab Sentinel viene ricaricata/chiusa
+l'app viene chiusa mentre Playwright sta scrivendo
+la sessione CDP del browser cade
+due operazioni provano a usare la tab quasi insieme
+```
+
+Questa versione chiude Playwright in modo più ordinato e serializza le operazioni per ridurre il problema.
 
 ---
 
-## 13. Procedura consigliata
+## Reset stato locale
+
+Per cancellare database e stato locale:
 
 ```text
-1. Avvia app
+reset_local_state_windows.bat
+```
+
+Questo resetta:
+
+```text
+incident letti
+azioni/log UI
+ultimo timestamp SLA
+owner display name salvato
+settings KPI
+```
+
+---
+
+## Procedura consigliata
+
+```text
+1. Avvia l'app
 2. Lancia Chrome/Edge dal bottone dell'app
 3. Login Azure + MFA + PIM
 4. Apri Sentinel > Incidents
 5. Premi FETCH CURRENT VIEW NOW
-6. Controlla la dashboard
+6. Controlla dashboard
 7. Premi START DRY-RUN
-8. Verifica Actions / logs
+8. Controlla Actions / logs
 9. Premi START REAL BOT
+10. Usa STOP per fermare bot e auto-fetch
 ```
-
----
-
-## 14. Troubleshooting
-
-### La tab Sentinel non compare
-
-```text
-1. Premi Refresh browser tabs
-2. Se non basta, chiudi il browser bot
-3. Riapri con Launch Chrome/Edge for bot
-4. Rifai login e torna su Sentinel > Incidents
-```
-
-### Gli incident chiusi restano in dashboard
-
-Premi:
-
-```text
-FETCH CURRENT VIEW NOW
-```
-
-La dashboard rimuove gli incident non più presenti nella vista corrente quando la lettura contiene almeno un incident valido.
-
-### Il bot non assegna un incident
-
-Controlla Owner. Se è già assegnato a un altro utente, è corretto che il bot lo salti.
-
-### Il bot non mette Active
-
-Il bot mette Active solo se:
-
-```text
-Owner = me
-Status = New
-```
-
-### Voglio vedere errori tecnici
-
-Usa:
-
-```text
-run_desktop_app_debug_console_windows.bat
-```
-
----
-
-## Nota finale
-
-Il bot lavora sulla vista Sentinel selezionata. Filtri, workspace e colonne visibili in Sentinel influenzano cosa il bot legge e processa.

@@ -1,5 +1,5 @@
 
-import math, os, queue, re, shutil, sqlite3, subprocess, threading, time, tkinter as tk
+import math, os, queue, re, shutil, sqlite3, subprocess, threading, time, tkinter as tk, sys, traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +17,50 @@ LOG_DIR.mkdir(exist_ok=True)
 BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
 CHROME_DEBUG_PORT = 9222
 EDGE_DEBUG_PORT = 9223
+
+APP_LOG_PATH = LOG_DIR / "app.log"
+
+def log_file(event, details="", exc=None):
+    """
+    Append diagnostic information to logs/app.log.
+    This is intentionally simple and dependency-free so it also works when UI/DB logging fails.
+    """
+    try:
+        ts = datetime.now().isoformat(timespec="seconds")
+        msg = f"[{ts}] {event}"
+        if details:
+            msg += f" | {details}"
+        if exc is not None:
+            msg += "\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        with APP_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+def install_global_exception_logging():
+    def _excepthook(exc_type, exc, tb):
+        try:
+            log_file("UNHANDLED_EXCEPTION", "", exc)
+        finally:
+            try:
+                sys.__excepthook__(exc_type, exc, tb)
+            except Exception:
+                pass
+
+    sys.excepthook = _excepthook
+
+    try:
+        def _threading_excepthook(args):
+            try:
+                log_file("UNHANDLED_THREAD_EXCEPTION", getattr(args.thread, "name", ""), args.exc_value)
+            except Exception:
+                pass
+        threading.excepthook = _threading_excepthook
+    except Exception:
+        pass
+
+install_global_exception_logging()
+
 
 def now_utc(): return datetime.now(timezone.utc)
 def now_iso(): return now_utc().isoformat(timespec="seconds")
@@ -208,6 +252,12 @@ class Storage:
     def log_action(self, key, title, action, result, details=""):
         with self.connect() as con:
             con.execute("INSERT INTO actions(ts,incident_key,title,action,result,details) VALUES(?,?,?,?,?,?)", (now_iso(), key, title, action, result, details))
+
+    def log_system(self, action, result, details=""):
+        try:
+            self.log_action("__SYSTEM__", "System", action, result, details)
+        except Exception as e:
+            log_file("DB_LOG_SYSTEM_FAILED", f"{action} {result} {details}", e)
     def upsert_seen(self, key, title, severity, status, owner, created="", last_update="", workspace="", source=""):
         ts = now_iso(); first_active = ts if (status or '').lower() == 'active' else None
         with self.connect() as con:
@@ -1159,7 +1209,7 @@ class SentinelPageBot:
 
 class BotWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.running_bot=False; self.paused=False; self.dry_run=True; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0
+        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_bot=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=True; self.starting=False; self.shutdown_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
     def set_runtime_state(self, **changes):
         with self.state_lock:
@@ -1173,11 +1223,14 @@ class BotWorker(threading.Thread):
                 'paused': self.paused,
                 'dry_run': self.dry_run,
                 'last_scan_ts': self.last_scan_ts,
+                'auto_fetch_enabled': self.auto_fetch_enabled,
+                'starting': self.starting,
+                'shutdown_requested': self.shutdown_requested,
             }
 
     def can_continue_flag(self):
         with self.state_lock:
-            return self.running_bot and not self.paused
+            return self.running_bot and not self.paused and not self.shutdown_requested
 
     def connect_browsers(self):
         if self.playwright is None: self.playwright=sync_playwright().start()
@@ -1202,7 +1255,13 @@ class BotWorker(threading.Thread):
     def selected_page(self):
         if not self.target_page_id: raise RuntimeError('Nessuna tab Sentinel selezionata.')
         page=self.pages.get(self.target_page_id)
-        if page is None: raise RuntimeError('Tab selezionata non più disponibile. Premi Refresh browser tabs.')
+        if page is None:
+            raise RuntimeError('Tab selezionata non più disponibile. Premi Refresh browser tabs.')
+        try:
+            if page.is_closed():
+                raise RuntimeError('Tab selezionata chiusa. Premi Refresh browser tabs e seleziona di nuovo Sentinel.')
+        except AttributeError:
+            pass
         return page
     def settings_dict(self): return self.settings.__dict__.copy()
     def update_settings(self, vals):
@@ -1255,47 +1314,183 @@ class BotWorker(threading.Thread):
             warnings += 1
         return warnings
     def run_scan(self, fetch_only=False):
-        page = self.selected_page()
-        state = self.get_runtime_state()
-        bot = SentinelPageBot(page, self.store, self.settings)
-        bot.can_continue = (lambda: True) if fetch_only else self.can_continue_flag
-        scanned, processed = bot.scan(state['dry_run'], fetch_only)
-        warnings = self.check_sla()
-        self.emit('scan_result', {'scanned':scanned,'processed':processed,'warnings':warnings,'fetch_only':fetch_only,'incidents':self.store.incidents(),'actions':self.store.actions(),'settings':self.settings_dict(),'target_url':page.url})
+        """
+        Runs exactly one browser operation at a time.
+        This prevents auto-fetch and bot actions from touching the same Sentinel tab together.
+        """
+        with self.operation_lock:
+            state = self.get_runtime_state()
+            if state.get('shutdown_requested'):
+                self.store.log_system('SCAN', 'SKIP_SHUTDOWN', f'fetch_only={fetch_only}')
+                return 0, 0
+
+            if (not fetch_only) and (not self.can_continue_flag()):
+                self.store.log_system('SCAN', 'SKIP_STOPPED', 'Bot stopped or paused before scan start')
+                return 0, 0
+
+            page = self.selected_page()
+            self.store.log_system('FETCH' if fetch_only else 'SCAN', 'START', f'url={getattr(page, "url", "")}')
+
+            try:
+                bot = SentinelPageBot(page, self.store, self.settings)
+                bot.can_continue = (lambda: not self.get_runtime_state().get('shutdown_requested')) if fetch_only else self.can_continue_flag
+                scanned, processed = bot.scan(state['dry_run'], fetch_only)
+                warnings = self.check_sla()
+
+                self.emit('scan_result', {
+                    'scanned': scanned,
+                    'processed': processed,
+                    'warnings': warnings,
+                    'fetch_only': fetch_only,
+                    'incidents': self.store.incidents(),
+                    'actions': self.store.actions(),
+                    'settings': self.settings_dict(),
+                    'target_url': page.url
+                })
+                self.store.log_system('FETCH' if fetch_only else 'SCAN', 'SUCCESS', f'scanned={scanned}, processed={processed}, warnings={warnings}')
+                return scanned, processed
+
+            except Exception as e:
+                details = f'fetch_only={fetch_only}; error={type(e).__name__}: {e}'
+                log_file('RUN_SCAN_ERROR', details, e)
+                self.store.log_system('FETCH' if fetch_only else 'SCAN', 'ERROR', details)
+                self.emit('error', {'message': details, 'actions': self.store.actions()})
+                return 0, 0
+
+    def cleanup_playwright(self):
+        try:
+            for _, br in list(self.browsers):
+                try:
+                    br.close()
+                except Exception as e:
+                    log_file('BROWSER_CONNECTION_CLOSE_ERROR', '', e)
+            self.browsers = []
+            self.pages = {}
+        except Exception as e:
+            log_file('CLEANUP_BROWSERS_ERROR', '', e)
+
+        try:
+            if self.playwright is not None:
+                self.playwright.stop()
+                self.playwright = None
+        except Exception as e:
+            log_file('PLAYWRIGHT_STOP_ERROR', '', e)
+
     def handle(self,cmd):
-        a=cmd.get('action')
-        if a=='refresh_pages': self.refresh_pages()
-        elif a=='select_page': self.target_page_id=cmd.get('page_id'); self.emit('status',{'message':f'Selected page: {self.target_page_id}','settings':self.settings_dict()})
-        elif a=='fetch': self.emit('status',{'message':'Fetching selected Sentinel tab without refreshing page...','settings':self.settings_dict()}); self.run_scan(fetch_only=True); self.last_fetch_ts=time.time()
-        elif a=='start': self.set_runtime_state(dry_run=bool(cmd.get('dry_run',True)), running_bot=True, paused=False, last_scan_ts=0); self.emit('status',{'message':'Bot started in '+('dry-run' if bool(cmd.get('dry_run',True)) else 'real')+' mode','settings':self.settings_dict()})
-        elif a=='pause': self.set_runtime_state(paused=True); self.emit('status',{'message':'Bot paused','settings':self.settings_dict()})
-        elif a=='resume': self.set_runtime_state(paused=False, running_bot=True); self.emit('status',{'message':'Bot resumed','settings':self.settings_dict()})
-        elif a=='stop': self.set_runtime_state(running_bot=False, paused=False); self.emit('status',{'message':'Bot stopped','settings':self.settings_dict()})
-        elif a=='settings': self.update_settings(cmd.get('values',{}))
+        a = cmd.get('action')
+        try:
+            if a == 'refresh_pages':
+                self.refresh_pages()
+
+            elif a == 'select_page':
+                self.target_page_id = cmd.get('page_id')
+                self.store.log_system('SELECT_PAGE', 'SUCCESS', str(self.target_page_id))
+                self.emit('status', {'message':f'Selected page: {self.target_page_id}', 'settings':self.settings_dict()})
+
+            elif a == 'fetch':
+                # Manual fetch is allowed, but still serialized with every other browser operation.
+                self.set_runtime_state(auto_fetch_enabled=True, starting=False)
+                self.emit('status', {'message':'Fetching selected Sentinel tab without refreshing page...', 'settings':self.settings_dict()})
+                self.run_scan(fetch_only=True)
+                self.last_fetch_ts = time.time()
+
+            elif a == 'start':
+                dry = bool(cmd.get('dry_run', True))
+                self.set_runtime_state(dry_run=dry, running_bot=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
+                self.store.log_system('BOT_START_REQUEST', 'RECEIVED', 'mode=' + ('dry-run' if dry else 'real'))
+                self.emit('status', {'message':'Initial fetch before bot start...', 'settings':self.settings_dict()})
+
+                # Initial fetch first, then enable the real/dry-run bot.
+                self.run_scan(fetch_only=True)
+                if not self.get_runtime_state().get('shutdown_requested'):
+                    self.set_runtime_state(dry_run=dry, running_bot=True, paused=False, starting=False, auto_fetch_enabled=False, last_scan_ts=0)
+                    self.emit('status', {'message':'Bot started in '+('dry-run' if dry else 'real')+' mode after initial fetch', 'settings':self.settings_dict()})
+                    self.store.log_system('BOT_START', 'SUCCESS', 'mode=' + ('dry-run' if dry else 'real'))
+
+            elif a == 'pause':
+                self.set_runtime_state(paused=True, auto_fetch_enabled=False)
+                self.store.log_system('BOT_PAUSE', 'SUCCESS', '')
+                self.emit('status', {'message':'Bot paused. Auto-fetch disabled.', 'settings':self.settings_dict()})
+
+            elif a == 'resume':
+                self.set_runtime_state(paused=False, running_bot=True, auto_fetch_enabled=False)
+                self.store.log_system('BOT_RESUME', 'SUCCESS', '')
+                self.emit('status', {'message':'Bot resumed. Auto-fetch disabled while bot is running.', 'settings':self.settings_dict()})
+
+            elif a == 'stop':
+                # Stop means stop bot and stop background auto-fetch.
+                self.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False)
+                self.store.log_system('BOT_STOP', 'SUCCESS', 'Bot stopped; auto-fetch disabled')
+                self.emit('status', {'message':'Bot stopped. Auto-fetch disabled; use FETCH CURRENT VIEW NOW for manual refresh.', 'settings':self.settings_dict()})
+
+            elif a == 'settings':
+                self.update_settings(cmd.get('values',{}))
+
+            elif a == 'shutdown':
+                self.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
+                self.store.log_system('APP_SHUTDOWN', 'REQUESTED', '')
+                self.cleanup_playwright()
+                self.emit('status', {'message':'Shutdown complete', 'settings':self.settings_dict()})
+
+        except Exception as e:
+            details = f'action={a}; error={type(e).__name__}: {e}'
+            log_file('HANDLE_ERROR', details, e)
+            self.store.log_system('HANDLE', 'ERROR', details)
+            self.emit('error', {'message': details, 'actions': self.store.actions()})
+
     def run(self):
         self.emit('status', {'message':'Worker ready. Click Launch Chrome/Edge for bot: the app will open and auto-link the new tab.','settings':self.settings_dict()})
+        self.store.log_system('WORKER', 'READY', '')
         while True:
             try:
-                try: self.handle(self.in_q.get(timeout=1))
-                except queue.Empty: pass
-                # Auto-fetch non invasivo: aggiorna la dashboard leggendo la vista corrente senza ricaricare la pagina.
-                # Parte solo quando il bot reale/dry-run non è in esecuzione, così non interferisce con le azioni automatiche.
-                state = self.get_runtime_state()
-                if (not state['running_bot']) and (not state['paused']) and self.target_page_id and time.time()-self.last_fetch_ts>=self.settings.auto_fetch_interval_seconds:
-                    self.last_fetch_ts=time.time()
-                    try:
-                        self.emit('status',{'message':'Auto-fetch current Sentinel view...', 'settings':self.settings_dict()})
-                        self.run_scan(fetch_only=True)
-                    except Exception as e:
-                        # Evita popup continui: l'errore viene mostrato nello status, non come messagebox ripetuto.
-                        self.emit('status',{'message':'Auto-fetch skipped: '+str(e), 'settings':self.settings_dict()})
+                try:
+                    cmd = self.in_q.get(timeout=1)
+                    self.handle(cmd)
+                except queue.Empty:
+                    pass
 
                 state = self.get_runtime_state()
-                if state['running_bot'] and not state['paused'] and self.target_page_id and time.time()-state['last_scan_ts']>=self.settings.scan_interval_seconds:
+                if state.get('shutdown_requested'):
+                    break
+
+                # Auto-fetch runs only when explicitly enabled and when the bot is fully stopped.
+                # It never runs while starting/running/paused to avoid touching the same tab together with the bot.
+                state = self.get_runtime_state()
+                if (
+                    state.get('auto_fetch_enabled')
+                    and not state.get('running_bot')
+                    and not state.get('paused')
+                    and not state.get('starting')
+                    and self.target_page_id
+                    and time.time() - self.last_fetch_ts >= self.settings.auto_fetch_interval_seconds
+                ):
+                    self.last_fetch_ts = time.time()
+                    self.emit('status', {'message':'Auto-fetch current Sentinel view...', 'settings':self.settings_dict()})
+                    self.run_scan(fetch_only=True)
+
+                state = self.get_runtime_state()
+                if (
+                    state.get('running_bot')
+                    and not state.get('paused')
+                    and not state.get('starting')
+                    and self.target_page_id
+                    and time.time() - state.get('last_scan_ts', 0) >= self.settings.scan_interval_seconds
+                ):
                     self.set_runtime_state(last_scan_ts=time.time())
-                    try: self.emit('status',{'message':'Automatic scan running...','settings':self.settings_dict()}); self.run_scan(False)
-                    except Exception as e: self.emit('error',{'message':str(e)})
-            except Exception as e: self.emit('error',{'message':str(e)})
+                    self.emit('status', {'message':'Automatic bot scan running...', 'settings':self.settings_dict()})
+                    self.run_scan(fetch_only=False)
+
+            except Exception as e:
+                details = f'worker loop error={type(e).__name__}: {e}'
+                log_file('WORKER_LOOP_ERROR', details, e)
+                try:
+                    self.store.log_system('WORKER_LOOP', 'ERROR', details)
+                except Exception:
+                    pass
+                self.emit('error', {'message': details, 'actions': self.store.actions() if hasattr(self, 'store') else []})
+
+        self.cleanup_playwright()
+        self.store.log_system('WORKER', 'EXIT', '')
 
 def find_chrome_path():
     for c in [os.path.join(os.environ.get('ProgramFiles',''),'Google','Chrome','Application','chrome.exe'), os.path.join(os.environ.get('ProgramFiles(x86)',''),'Google','Chrome','Application','chrome.exe'), shutil.which('chrome.exe')]:
@@ -1370,7 +1565,7 @@ class BotApp(tk.Tk):
             ('RESUME',self.resume_bot),
             ('STOP',self.stop_bot)
         ]: ttk.Button(ctr,text=text,command=cmd).pack(side='left',padx=(0,6))
-        self.status_var=tk.StringVar(value='Ready'); ttk.Label(ctr,textvariable=self.status_var,foreground='#0f172a').pack(side='left',padx=(16,0))
+        self.status_var=tk.StringVar(value='Ready'); ttk.Label(ctr,textvariable=self.status_var,foreground='#0f172a').pack(side='left',padx=(16,0)); ttk.Label(ctr,text='Logs: data/bot_state.sqlite3 + logs/app.log',foreground='#64748b').pack(side='right',padx=(8,0))
         sla=ttk.LabelFrame(root,text='3) SLA settings',padding=10); sla.pack(fill='x',pady=(0,8))
         self.sla_vars={
             'sla_critical_minutes':tk.IntVar(value=30),'sla_high_minutes':tk.IntVar(value=30),'sla_medium_minutes':tk.IntVar(value=60),'sla_low_minutes':tk.IntVar(value=60),'sla_informational_minutes':tk.IntVar(value=60),
@@ -1418,38 +1613,46 @@ class BotApp(tk.Tk):
 
     def on_close(self):
         try:
-            self.send('stop')
+            self.worker.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
         except Exception:
             pass
         try:
-            self.destroy()
+            self.send('shutdown')
         except Exception:
             pass
-        # Hard exit: avoids hidden python/pythonw process remaining alive because of Playwright/CDP threads.
-        try:
-            os._exit(0)
-        except Exception:
-            pass
+
+        # Give Playwright/Node a short window to close the pipe cleanly.
+        def _finish_close():
+            try:
+                self.destroy()
+            except Exception:
+                pass
+            try:
+                os._exit(0)
+            except Exception:
+                pass
+
+        self.after(1200, _finish_close)
 
 
     def start_bot(self, dry_run):
-        self.worker.set_runtime_state(dry_run=bool(dry_run), running_bot=True, paused=False, last_scan_ts=0)
-        self.status_var.set('Bot started in ' + ('dry-run' if dry_run else 'real') + ' mode')
+        self.worker.set_runtime_state(dry_run=bool(dry_run), running_bot=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
+        self.status_var.set('Starting bot: initial fetch first...')
         self.send('start', dry_run=dry_run)
 
     def pause_bot(self):
-        self.worker.set_runtime_state(paused=True)
-        self.status_var.set('Bot paused')
+        self.worker.set_runtime_state(paused=True, auto_fetch_enabled=False)
+        self.status_var.set('Bot paused. Auto-fetch disabled.')
         self.send('pause')
 
     def resume_bot(self):
-        self.worker.set_runtime_state(paused=False, running_bot=True)
-        self.status_var.set('Bot resumed')
+        self.worker.set_runtime_state(paused=False, running_bot=True, auto_fetch_enabled=False)
+        self.status_var.set('Bot resumed.')
         self.send('resume')
 
     def stop_bot(self):
-        self.worker.set_runtime_state(running_bot=False, paused=False)
-        self.status_var.set('Bot stopped')
+        self.worker.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False)
+        self.status_var.set('Bot stopped. Auto-fetch disabled.')
         self.send('stop')
 
     def save_sla(self): self.send('settings', values={k:v.get() for k,v in self.sla_vars.items()})
@@ -1556,7 +1759,7 @@ class BotApp(tk.Tk):
                 elif kind=='status': self.status_var.set(msg.get('message','')); self.apply_settings(msg.get('settings',{}))
                 elif kind=='scan_result': self.status_var.set(f"Scan done. Seen={msg.get('scanned')}, processed={msg.get('processed')}, SLA notifications={msg.get('warnings')}"); self.refresh_incidents(msg.get('incidents',[])); self.refresh_actions(msg.get('actions',[])); self.apply_settings(msg.get('settings',{}))
                 elif kind=='sla_alert': self.show_sla_popup(msg.get('title','SLA warning'), msg.get('message',''), msg.get('severity','Medium'))
-                elif kind=='error': self.status_var.set('ERROR: '+msg.get('message','')); messagebox.showwarning('Bot error', msg.get('message','Unknown error'))
+                elif kind=='error': self.status_var.set('ERROR: '+msg.get('message','')); self.refresh_actions(msg.get('actions',[])); messagebox.showwarning('Bot error', msg.get('message','Unknown error'))
         except queue.Empty: pass
         self.after(700,self.poll_worker)
 
