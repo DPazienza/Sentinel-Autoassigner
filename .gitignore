@@ -1,0 +1,25 @@
+# Runtime artifacts
+app/logs/
+app/browser_profiles/
+app/__pycache__/
+app/*/*.log
+app/*.log
+app/*.out
+app/*.err
+app/*_err.log
+app/*_out.log
+app/tmp_*.log
+
+# Generated/development bundles accidentally left in repo
+app/_uiux_src/
+
+# Runtime databases and transient app state
+app/data/*.sqlite3
+app/data/*.sqlite
+app/data/*.db
+
+# Local screenshots or temporary UI artifacts
+app/ui_live_window.png
+app/*/ui_live_window.png
+*.sqlite3
+*.db
