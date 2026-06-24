@@ -21,6 +21,7 @@
       --chip-bg: #f1f5f9;
       --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
       --radius: 14px;
+      --ui-scale: 1;
     }
 
     * { box-sizing: border-box; }
@@ -38,6 +39,7 @@
       margin: 12px auto;
       display: grid;
       gap: 14px;
+      zoom: var(--ui-scale);
     }
 
     .header {
@@ -555,6 +557,19 @@
   </main>
 
   <script>
+    function setAdaptiveUiScale() {
+      try {
+        const dpr = window.devicePixelRatio || 1;
+        const scaled = Math.max(0.86, Math.min(1, 1.15 / dpr));
+        const root = document.documentElement;
+        root.style.setProperty('--ui-scale', scaled.toFixed(3));
+      } catch {
+        // fallback default
+      }
+    }
+
+    setAdaptiveUiScale();
+
     const slaMap = [
       {key:'critical', tc:'tc-critical', nt:'nt-critical', rt:'rt-critical', kpi:'kpi-critical', color:'urgent'},
       {key:'high', tc:'tc-high', nt:'nt-high', rt:'rt-high', kpi:'kpi-high', color:'warning'},
