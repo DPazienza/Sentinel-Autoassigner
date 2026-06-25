@@ -63,6 +63,79 @@ Il batch avvia l'app con `pythonw` e UI webview.
 3. Selezionare la tab Sentinel.
 4. Avviare il bot (`Start` dry-run o reale).
 
+## Panoramica dettagliata UI
+
+La finestra principale e' divisa in blocchi funzionali per separare controllo, stato e dettaglio incident:
+
+- **Header / Stato globale**
+  - Titolo app e stato corrente del worker.
+  - Label di stato in basso con messaggi operativi (`Ready/scan running/fetch done/error`).
+
+- **Workspace / Browser**
+  - Sezione con pulsanti `Lancia Chrome Debug` e `Lancia Edge Debug`.
+  - Pulsante `Refresh browser tabs` per rilista tutte le tab correnti collegate ai CDP.
+  - Elenco tab con:
+    - Browser (Chrome/Edge)
+    - Indicatore Sentinel (`Yes/No`)
+    - Titolo e URL
+  - Selezionando una riga, l'app imposta la tab target per fetch/scan.
+
+- **Controllo bot e stato esecuzione**
+  - `Start (dry-run)` e `Start (reale)`: avviano il ciclo automatico con primo fetch immediato.
+  - `Pause` / `Resume`: mettono in pausa l'esecuzione automatica senza cancellare lo stato.
+  - `Stop`: ferma bot, auto-fetch e loop operativi.
+  - `FETCH CURRENT VIEW NOW`: forza una lettura immediata della vista corrente (solo quando il bot non sta processando).
+
+- **Blocchi SLA / impostazioni avanzate**
+  - Card dedicata ai threshold:
+    - `Taking Charge / Notification / Resolution` per severita' (Critical, High, Medium, Low).
+    - `Misclassification %`.
+    - `% notifiche Windows`, `Ripeti notifica (min)`.
+    - `Scan interval (s)`, `Auto-fetch interval (s)`.
+  - Le impostazioni sono persistite e inviate al worker con `Salva impostazioni`.
+
+- **Tab Incidenti**
+  - Griglia con campi principali:
+    - ID incident
+    - Severity
+    - Stato/Owner
+    - Titolo
+    - Timestamps
+    - Remaining SLA (Taking charge/Notification)
+    - Ultimo warning / ultimo aggiornamento
+  - Colorazioni per severita' (critical/high/medium/low) e stato.
+  - Azioni per riga:
+    - `Ignore` (da UI principale): imposta l'incidente come ignorato localmente senza cancellare manualmente dal DB core.
+
+- **Tab Azioni/Log**
+  - Log cronologico di tutte le azioni principali:
+    - fetch/scan
+    - assignment
+    - stato active
+    - notifiche sent/sentenza
+  - Utile per audit e diagnostica rapida.
+
+## Flusso UI in uso quotidiano
+
+1. Avvio app.
+2. Lancio/connessione browser debug.
+3. Refresh tab e selezione della pagina Sentinel corretta.
+4. Settaggio intervalli (opzionale) e check SLA.
+5. Start dry-run per verifica senza modifiche.
+6. Passaggio a start reale quando la lista si comporta correttamente.
+
+## Come leggere i campi chiave
+
+- **Status bot**: riflette direttamente lo stato del runtime (`running`, `paused`, `starting`, `stop`) ed evita conflitti tra scan automatici e fetch manuali.
+- **AUTO-FETCH / SCAN**:
+  - Auto-fetch: leggeri refetch su tab selezionata quando il bot e' fermo.
+  - Scan: ciclo automatico completo quando bot in run con intervallo `Scan interval (s)`.
+- **Incident row status**:
+  - `new active/closed` visibile nel campo stato.
+  - owner e percentuale di ETA sono aggiornati dopo refresh.
+- **SLA columns**:
+  - il valore mostrato e' il tempo residuo in minuti verso la soglia corrente della severita' impostata.
+
 ### Opzioni bot
 
 - **Fetch current view**: forza una lettura rapida della vista attiva.
