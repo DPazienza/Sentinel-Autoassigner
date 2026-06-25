@@ -1880,6 +1880,34 @@ class BotWorker(threading.Thread):
         elapsed = int((time.perf_counter() - started) * 1000)
         log_file("BROWSER_CONNECT_DONE", f"connected={connected};elapsed_ms={elapsed}")
         return connected
+
+    def restore_browser_window(self, page):
+        """
+        If the browser is minimized or not in foreground, bring the target tab/page
+        forward before UI interactions. This fixes missed clicks/reads when the
+        browser is iconified on Windows.
+        """
+        try:
+            page.bring_to_front()
+            try:
+                page.mouse.move(1, 1)
+                page.mouse.move(10, 10)
+            except Exception:
+                pass
+            try:
+                page.mouse.wheel(0, 0)
+            except Exception:
+                pass
+            try:
+                page.keyboard.press('Escape', delay=10)
+            except Exception:
+                pass
+            log_file("PAGE_RESTORE", f"target={self.target_page_id}")
+            return True
+        except Exception as exc:
+            log_file("PAGE_RESTORE_FAIL", f"target={self.target_page_id}", exc)
+            return False
+
     def refresh_pages(self):
         connected=self.connect_browsers(); rows=[]; self.pages={}
         log_file("REFRESH_PAGES_START", f"connected_candidates={connected}")
@@ -2079,6 +2107,11 @@ class BotWorker(threading.Thread):
                 return 0, 0
 
             page = self.selected_page()
+            if not self.restore_browser_window(page):
+                self.store.log_system('SCAN', 'WINDOW_RESTORE_FAIL', 'Skipping interaction until browser recovers')
+                log_file("RUN_SCAN_SKIP", f"run_id={run_id};reason=restore_browser_window_failed;fetch_only={fetch_only}")
+                self.set_runtime_state(operation_in_progress=False, operation_kind='')
+                return 0, 0
             self.store.log_system('FETCH' if fetch_only else 'SCAN', 'START', f'url={getattr(page, "url", "")}')
             log_file("RUN_SCAN_START", f"run_id={run_id};fetch_only={fetch_only};url={getattr(page,'url','')}")
 
