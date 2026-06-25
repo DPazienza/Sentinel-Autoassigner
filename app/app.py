@@ -1883,30 +1883,25 @@ class BotWorker(threading.Thread):
 
     def restore_browser_window(self, page):
         """
-        If the browser is minimized or not in foreground, bring the target tab/page
-        forward before UI interactions. This fixes missed clicks/reads when the
-        browser is iconified on Windows.
+        Kept as a best-effort background check.
+        We intentionally avoid forcing window focus now, so the bot can keep running
+        while Chrome/Edge stay on another desktop or minimized.
         """
-        try:
-            page.bring_to_front()
+        for attempt in range(1, 4):
             try:
-                page.mouse.move(1, 1)
-                page.mouse.move(10, 10)
-            except Exception:
-                pass
-            try:
-                page.mouse.wheel(0, 0)
-            except Exception:
-                pass
-            try:
-                page.keyboard.press('Escape', delay=10)
-            except Exception:
-                pass
-            log_file("PAGE_RESTORE", f"target={self.target_page_id}")
-            return True
-        except Exception as exc:
-            log_file("PAGE_RESTORE_FAIL", f"target={self.target_page_id}", exc)
-            return False
+                if page.is_closed():
+                    raise RuntimeError("target page closed")
+                # Background-safe: only verify the page is reachable, no focus forcing.
+                try:
+                    page.wait_for_load_state('domcontentloaded', timeout=1000)
+                except Exception:
+                    page.wait_for_load_state('load', timeout=1000)
+                log_file("PAGE_RESTORE", f"target={self.target_page_id};attempt={attempt}")
+                return True
+            except Exception as exc:
+                log_file("PAGE_RESTORE_FAIL", f"target={self.target_page_id};attempt={attempt}", exc)
+                time.sleep(0.2)
+        return False
 
     def refresh_pages(self):
         connected=self.connect_browsers(); rows=[]; self.pages={}
@@ -2108,10 +2103,8 @@ class BotWorker(threading.Thread):
 
             page = self.selected_page()
             if not self.restore_browser_window(page):
-                self.store.log_system('SCAN', 'WINDOW_RESTORE_FAIL', 'Skipping interaction until browser recovers')
-                log_file("RUN_SCAN_SKIP", f"run_id={run_id};reason=restore_browser_window_failed;fetch_only={fetch_only}")
-                self.set_runtime_state(operation_in_progress=False, operation_kind='')
-                return 0, 0
+                self.store.log_system('SCAN', 'WINDOW_RESTORE_FAIL', 'Continuing without explicit restore')
+                log_file("RUN_SCAN_CONTINUE", f"run_id={run_id};reason=restore_browser_window_failed;fetch_only={fetch_only}")
             self.store.log_system('FETCH' if fetch_only else 'SCAN', 'START', f'url={getattr(page, "url", "")}')
             log_file("RUN_SCAN_START", f"run_id={run_id};fetch_only={fetch_only};url={getattr(page,'url','')}")
 
@@ -2382,6 +2375,15 @@ def find_edge_path():
         if c and Path(c).exists(): return c
     return None
 
+def _debug_port_alive(port):
+    url = f"http://127.0.0.1:{port}/json/version"
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=1) as resp:
+            return 200 <= getattr(resp, "status", 0) < 400
+    except Exception:
+        return False
+
 def launch_browser_debug(browser):
     """
     Avvia un'istanza Chromium debuggabile e separata dalle finestre normali.
@@ -2397,6 +2399,10 @@ def launch_browser_debug(browser):
         messagebox.showerror('Browser non trovato', f'{browser} non trovato.')
         return False
 
+    if _debug_port_alive(port):
+        log_file("LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_listening")
+        return True
+
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     args=[
@@ -2407,7 +2413,12 @@ def launch_browser_debug(browser):
         f'--user-data-dir={str(profile_dir)}',
         '--no-first-run',
         '--no-default-browser-check',
+        '--start-minimized',
         '--new-window',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        '--disable-features=CalculateNativeWinOcclusion',
         'https://portal.azure.com/'
     ]
 

@@ -32,6 +32,14 @@ def _launch_browser_process(browser):
         return False, f"{browser} non trovato"
 
     port = core.CHROME_DEBUG_PORT if browser == "chrome" else core.EDGE_DEBUG_PORT
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
+            if 200 <= getattr(resp, "status", 0) < 400:
+                return True, ""
+    except Exception:
+        pass
+
     profile_name = "chrome_bot_profile" if browser == "chrome" else "edge_bot_profile"
     profile_dir = (core.BROWSER_PROFILE_DIR / profile_name).resolve()
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -44,6 +52,11 @@ def _launch_browser_process(browser):
         f"--user-data-dir={str(profile_dir)}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--start-minimized",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-features=CalculateNativeWinOcclusion",
         "--new-window",
         "https://portal.azure.com/",
     ]
