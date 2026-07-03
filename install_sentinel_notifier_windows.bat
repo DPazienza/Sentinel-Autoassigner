@@ -1,11 +1,11 @@
-@echo off
+﻿@echo off
 setlocal enabledelayedexpansion
 
-title Sentinel Auto Assign Bot Desktop - Installer
+title Sentinel Notifier Desktop - Installer
 cd /d "%~dp0"
 
 echo ============================================================
-echo  Sentinel Auto Assign Bot Desktop - Windows Installer
+echo  Sentinel Notifier Desktop - Windows Installer
 echo ============================================================
 echo.
 
@@ -51,6 +51,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo.
 echo INSTALLAZIONE COMPLETATA.
-echo Avvia l'app con start_sentinel_autoassigner_windows.bat
+echo Avvia l'app con start_sentinel_notifier_windows.bat
 pause
 exit /b 0
+

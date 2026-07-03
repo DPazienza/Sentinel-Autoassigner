@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Sentinel Auto Assign Bot • Dashboard</title>
+    <title>Sentinel Notifier • Dashboard</title>
   <style>
     :root {
       --page: #f2f5f9;
@@ -331,8 +331,8 @@
   <main class="page">
     <section class="header">
       <div>
-        <h1>Sentinel Auto Assign Bot</h1>
-        <p class="subtitle">Dashboard operativa: workspace, stato bot e SLA in alto; incidenti in basso.</p>
+        <h1>Sentinel Notifier</h1>
+        <p class="subtitle">Dashboard operativa: workspace, Stato notifier e SLA in alto; incidenti in basso.</p>
       </div>
       <div class="status" id="runtimeBadge">Runtime: Attivo</div>
     </section>
@@ -376,7 +376,7 @@
       </article>
 
       <article class="card">
-        <h2>Stato bot</h2>
+        <h2>Stato notifier</h2>
         <p class="muted">Indicatore operativo rapido.</p>
         <div class="chip-row">
           <span class="chip">Scan: <span class="value" id="scanInterval">45s</span></span>
@@ -384,7 +384,7 @@
           <span class="chip">Notifiche: <span class="value">On</span></span>
         </div>
         <div class="stack" style="margin-top: 12px;">
-          <button class="btn" id="startBtn">Start bot (reale)</button>
+          <button class="btn" id="startBtn">Start monitor</button>
           <button class="btn secondary" id="fetchBtn">Fetch corrente</button>
           <button class="btn ghost" id="pauseResumeBtn">Pausa</button>
           <button class="btn danger" id="stopBtn">Stop</button>
@@ -882,3 +882,4 @@
   </script>
 </body>
 </html>
+

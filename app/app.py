@@ -18,6 +18,8 @@ LOG_DIR.mkdir(exist_ok=True)
 BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
 CHROME_DEBUG_PORT = 9222
 EDGE_DEBUG_PORT = 9223
+ENABLE_ASSIGNMENT_WORKFLOW = True
+KEEP_WINDOWS_AWAKE = True
 
 APP_LOG_PATH = LOG_DIR / "app.log"
 
@@ -38,6 +40,51 @@ def log_file(event, details="", exc=None):
             f.write(msg + "\n")
     except Exception:
         pass
+
+
+def enable_windows_background_runtime():
+    """
+    Keep the logged-in Windows session alive while the app is running.
+    This helps when the PC is locked: processes keep running, while the display
+    can still turn off. It cannot bypass sleep/hibernation policies enforced by IT.
+    """
+    if os.name != 'nt' or not KEEP_WINDOWS_AWAKE:
+        return False
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        result = ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+        )
+        log_file("WINDOWS_KEEP_AWAKE", f"enabled={bool(result)}")
+        return bool(result)
+    except Exception as exc:
+        log_file("WINDOWS_KEEP_AWAKE_FAIL", str(exc), exc)
+        return False
+
+
+def browser_profile_dir(browser):
+    browser = (browser or '').strip().lower()
+    if browser == 'chrome':
+        preferred = 'chrome_notifier_profile'
+        legacy = ['chrome_bot_profile', 'chrome_monitor_profile']
+    else:
+        preferred = 'edge_notifier_profile'
+        legacy = ['edge_bot_profile', 'edge_monitor_profile']
+
+    preferred_path = (BROWSER_PROFILE_DIR / preferred).resolve()
+    if preferred_path.exists():
+        return preferred_path
+
+    for name in legacy:
+        candidate = (BROWSER_PROFILE_DIR / name).resolve()
+        if candidate.exists():
+            log_file("BROWSER_PROFILE_LEGACY", f"browser={browser};profile={candidate}")
+            return candidate
+
+    return preferred_path
 
 def install_global_exception_logging():
     def _excepthook(exc_type, exc, tb):
@@ -275,7 +322,7 @@ def _get_winotify_notifier():
     try:
         if _WINOTIFY_NOTIFIER is None:
             from winotify import Notifier, Registry
-            registry = Registry("Sentinel Auto Assign Bot", script_path=str(Path(__file__).resolve()))
+            registry = Registry("Sentinel Notifier", script_path=str(Path(__file__).resolve()))
             _WINOTIFY_NOTIFIER = Notifier(registry)
             _WINOTIFY_NOTIFIER.start()
         return _WINOTIFY_NOTIFIER
@@ -374,7 +421,7 @@ def _notify_windows_toast(title, message, sev='medium', timeout=15, incident_key
         )
         doc = XmlDocument()
         doc.load_xml(toast_xml)
-        notifier = ToastNotificationManager.create_toast_notifier("Sentinel.AutoAssign.Bot")
+        notifier = ToastNotificationManager.create_toast_notifier("Sentinel.Notifier")
         notification = ToastNotification(doc)
         notifier.show(notification)
         log_file("WINDOWS_TOAST_OK", f"incident_key={incident_key};severity={sev};urgent={is_urgent};action_hooks={bool(is_urgent)}")
@@ -420,7 +467,7 @@ def _notify_windows_toast(title, message, sev='medium', timeout=15, incident_key
 def _notify_windows_plyer(title, message, timeout):
     try:
         from plyer import notification
-        notification.notify(title=title, message=message, timeout=timeout, app_name="Sentinel Auto Assign Bot")
+        notification.notify(title=title, message=message, timeout=timeout, app_name="Sentinel Notifier")
         log_file("WINDOWS_PLYER_OK", f"title={title}")
     except Exception:
         log_file("WINDOWS_PLYER_FAIL", f"title={title}")
@@ -670,16 +717,26 @@ class Storage:
         def _op(con):
             if not keys:
                 if clear_when_empty:
+                    stale = [str(r[0]) for r in con.execute("SELECT incident_key FROM incidents").fetchall()]
                     sync_status["status"] = "CLEARED_EMPTY_VIEW"
-                    sync_status["details"] = "No visible incidents in current Sentinel view"
+                    sync_status["details"] = f"No visible incidents in current Sentinel view; removed={len(stale)}"
                     con.execute("DELETE FROM incidents")
+                    con.execute("DELETE FROM actions")
+                    con.execute("DELETE FROM ignored_incidents")
+                    con.execute("DELETE FROM hidden_incidents")
                 else:
                     sync_status["status"] = "SKIP_EMPTY_UNSAFE"
                     sync_status["details"] = "Visible incident list empty and clear_when_empty=False"
                 return sync_status["status"], sync_status["details"]
 
             placeholders = ",".join(["?"] * len(keys))
+            stale = [str(r[0]) for r in con.execute(f"SELECT incident_key FROM incidents WHERE incident_key NOT IN ({placeholders})", keys).fetchall()]
             con.execute(f"DELETE FROM incidents WHERE incident_key NOT IN ({placeholders})", keys)
+            if stale:
+                stale_placeholders = ",".join(["?"] * len(stale))
+                con.execute(f"DELETE FROM actions WHERE incident_key IN ({stale_placeholders})", stale)
+                con.execute(f"DELETE FROM ignored_incidents WHERE incident_key IN ({stale_placeholders})", stale)
+                con.execute(f"DELETE FROM hidden_incidents WHERE incident_key IN ({stale_placeholders})", stale)
 
             # Ignored incidents must never reappear in the dashboard.
             try:
@@ -690,8 +747,7 @@ class Storage:
             except Exception as e:
                 log_file("SYNC_VISIBLE_IGNORED_SKIP", f"err={type(e).__name__}:{e}")
 
-            removed = con.execute("SELECT COUNT(*) FROM incidents WHERE incident_key NOT IN (" + ",".join(["?"] * len(keys)) + ")", tuple(keys)).fetchone()
-            removed_count = int(removed[0]) if removed and removed[0] is not None else 0
+            removed_count = len(stale)
             log_file("SYNC_VISIBLE", f"visible_count={len(keys)};removed_count={removed_count}")
             sync_status["details"] = f"visible_count={len(keys)};removed_count={removed_count}"
             return sync_status["status"], sync_status["details"]
@@ -858,7 +914,7 @@ def runtime_settings_from_storage(store):
     log_file("RUNTIME_SETTINGS_DONE", f"my_owner={s.my_owner_identity};scan={s.scan_interval_seconds};auto_fetch={s.auto_fetch_interval_seconds}")
     return s
 
-class SentinelPageBot:
+class SentinelPageMonitor:
     def __init__(self, page, store, settings):
         self.page = page
         self.store = store
@@ -903,6 +959,24 @@ class SentinelPageBot:
     def parse_row_identity(self, txt):
         text = normalize_text(txt)
         severity = ''
+
+        # Prefer the actual row shape: severity immediately before the incident ID.
+        # Page-level KPI text can contain "High (0) Medium (1)" before the row body,
+        # so taking the first severity word from the whole string is unsafe.
+        m = re.search(
+            r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\b\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{1,2}/\d{1,2}/\d{2,4})",
+            text,
+            re.I
+        )
+        if m:
+            return m.group(2), normalize_text(m.group(3)), m.group(1).title()
+
+        m = re.search(r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\b", text, re.I)
+        if m:
+            key = m.group(2)
+            idx = text.find(key)
+            return key, (text[idx + len(key):].strip()[:160] or key), m.group(1).title()
+
         for sev in ['Critical', 'High', 'Medium', 'Low', 'Informational']:
             if re.search(rf"\b{sev}\b", text, re.I):
                 severity = sev
@@ -916,7 +990,7 @@ class SentinelPageBot:
             re.I
         )
         if m:
-            return m.group(2), normalize_text(m.group(3)), severity
+            return m.group(2), normalize_text(m.group(3)), m.group(1).title()
 
         m = re.search(r"\b(\d{3,})\b", text)
         if m:
@@ -929,8 +1003,8 @@ class SentinelPageBot:
     def visible_incident_snapshot(self, max_rows=80, row_text_timeout_ms=800):
         """
         Snapshot iniziale degli incident visibili.
-        Salva gli ID prima di fare qualsiasi click. CosÃ¬, se una riga sparisce,
-        cambia posizione o la lista si riordina dopo l'assegnazione, il bot lavora
+        Salva gli ID prima di fare qualsiasi click. Cosi', se una riga sparisce,
+        cambia posizione o la lista si riordina dopo l'assegnazione, il monitor lavora
         comunque per ID e non per indice statico.
         """
         rows = self.page.get_by_role('row')
@@ -985,10 +1059,39 @@ class SentinelPageBot:
         log_file("SNAPSHOT_OK", f"rows={len(out)};source=per_row")
         return out
 
+    def current_view_reports_no_incidents(self):
+        """
+        Return True only when the loaded Sentinel page explicitly looks empty.
+        A parsing failure or half-loaded grid must not wipe local runtime state.
+        """
+        text = normalize_text(self.body()).lower()
+        if not text:
+            return False
+
+        empty_markers = [
+            'no incidents',
+            'no results',
+            'no items to show',
+            'there are no incidents',
+            'nessun incident',
+            'nessun risultato',
+        ]
+        if any(marker in text for marker in empty_markers):
+            return True
+
+        if re.search(r"\b0\s+open incidents\b", text, re.I):
+            return True
+        if re.search(r"\bopen incidents\s+0\b", text, re.I):
+            return True
+        if re.search(r"\b0\s+active incidents\b", text, re.I) and re.search(r"\b0\s+new incidents\b", text, re.I):
+            return True
+
+        return False
+
     def find_row_index_by_incident_id(self, incident_key, max_rows=120):
         """
         Cerca dinamicamente la riga con l'ID richiesto nella vista corrente.
-        Non usa l'indice vecchio, perchÃ© dopo assign/status la lista puÃ² cambiare.
+        Non usa l'indice vecchio, perche' dopo assign/status la lista puo' cambiare.
         """
         rows = self.page.get_by_role('row')
         try:
@@ -1251,7 +1354,7 @@ class SentinelPageBot:
 
     def wait_until_owner_assigned(self, incident_key, max_attempts=5):
         """
-        Verifica reale dalla UI: owner non deve piÃ¹ essere Unassigned.
+        Verifica reale dalla UI: owner non deve piu' essere Unassigned.
         """
         last_details = None
         for _ in range(max_attempts):
@@ -1496,7 +1599,7 @@ class SentinelPageBot:
     def status_is_active(self, status):
         return (status or '').lower() == 'active'
 
-    def assign_to_me_current_open_id(self, incident_key):
+    def WORKFLOW_STEP_current_open_id(self, incident_key):
         """
         Assegna solo l'incident attualmente aperto e poi verifica davvero dalla UI.
 
@@ -1516,7 +1619,7 @@ class SentinelPageBot:
         self.wait(500)
 
         if not self.click_text_in_right_pane(['Assign to me', 'Assign to myself', 'Assegna a me'], exact_first=False, timeout=1400, max_y_ratio=0.80):
-            # Fallback: clicca valore Unassigned solo dopo aver giÃ  verificato che l'owner Ã¨ Unassigned.
+            # Fallback: clicca valore Unassigned solo dopo aver gia' verificato che l'owner e' Unassigned.
             try:
                 self.page.keyboard.press('Escape')
             except Exception:
@@ -1560,7 +1663,7 @@ class SentinelPageBot:
         self.wait(500)
 
         if not self.click_text_in_right_pane(['Active', 'Attivo'], exact_first=True, timeout=1400, max_y_ratio=0.80):
-            # Fallback: clicca valore New solo dopo aver giÃ  verificato che lo status Ã¨ New.
+            # Fallback: clicca valore New solo dopo aver gia' verificato che lo status e' New.
             try:
                 self.page.keyboard.press('Escape')
             except Exception:
@@ -1611,7 +1714,7 @@ class SentinelPageBot:
 
         key = expected_key
         title = fallback_title
-        severity = fallback_severity or d['severity']
+        severity = d.get('severity') or fallback_severity
         status = d['status']
         owner = d['owner']
         workspace = self.workspace_hint()
@@ -1627,11 +1730,11 @@ class SentinelPageBot:
             log_file("PROCESS_INCIDENT_FETCH", f"key={key};status={status};owner={owner};severity={severity}")
             return True, False
 
-        # Dry-run: ragiona come il real bot, ma non clicca.
+        # Dry-run: ragiona come il real monitor, ma non clicca.
         if dry_run:
             planned = []
             if self.owner_is_unassigned(owner):
-                planned.append('AssignToMe')
+                planned.append('WorkflowStep' if ENABLE_ASSIGNMENT_WORKFLOW else 'AssignmentDisabled')
             if self.status_is_new(status):
                 planned.append('SetActive')
             if planned:
@@ -1644,13 +1747,18 @@ class SentinelPageBot:
 
         processed = False
 
-        # 1. Owner check: se Ã¨ davvero Unassigned, assegna a me.
-        # Se non Ã¨ Unassigned, non tocca l'owner.
+        # 1. Owner check: se e' davvero Unassigned, assegna a me.
+        # Se non e' Unassigned, non tocca l'owner.
         if self.owner_is_unassigned(owner):
+            if not ENABLE_ASSIGNMENT_WORKFLOW:
+                self.store.log_action(key, title, 'WORKFLOW_STEP', 'SKIP_DISABLED', f'owner={owner}')
+                log_file("PROCESS_INCIDENT_ASSIGN", f"key={key};skip_assignment_disabled=true;owner={owner}")
+                return True, False
+
             owner_before = owner
-            ok, result = self.assign_to_me_current_open_id(key)
+            ok, result = self.WORKFLOW_STEP_current_open_id(key)
             if not ok:
-                self.store.log_action(key, title, 'ASSIGN_TO_ME', 'FAILED', str(result))
+                self.store.log_action(key, title, 'WORKFLOW_STEP', 'FAILED', str(result))
                 return True, False
 
             processed = True
@@ -1671,11 +1779,11 @@ class SentinelPageBot:
                     self.store.save_settings({'my_owner_identity': owner})
                 except Exception:
                     pass
-            self.store.log_action(key, title, 'ASSIGN_TO_ME', 'SUCCESS_VERIFIED', f'owner_before={owner_before}, owner_after={owner}')
+            self.store.log_action(key, title, 'WORKFLOW_STEP', 'SUCCESS_VERIFIED', f'owner_before={owner_before}, owner_after={owner}')
             log_file("PROCESS_INCIDENT_ASSIGN", f"key={key};owner_before={owner_before};owner_after={owner}")
 
         else:
-            self.store.log_action(key, title, 'ASSIGN_TO_ME', 'SKIP', f'owner={owner}')
+            self.store.log_action(key, title, 'WORKFLOW_STEP', 'SKIP', f'owner={owner}')
             log_file("PROCESS_INCIDENT_ASSIGN", f"key={key};skip_owner={owner}")
 
         # 2. Status check: change Status only if the incident is now assigned to me.
@@ -1684,7 +1792,7 @@ class SentinelPageBot:
             self.store.log_action(key, title, 'SET_ACTIVE', 'SKIP_OTHER_OWNER', f'owner={owner}')
             return True, processed
 
-        # Prima di cliccare ricontrolla il detail pane dello stesso ID, perchÃ© la UI puÃ² aggiornarsi.
+        # Prima di cliccare ricontrolla il detail pane dello stesso ID, perche' la UI puo' aggiornarsi.
         panel2, d2 = self.read_open_incident_details(key)
         if panel2 is None or d2 is None:
             self.store.log_action(key, title, 'SET_ACTIVE', 'SKIP', 'ID mismatch before final status check')
@@ -1814,7 +1922,8 @@ class SentinelPageBot:
 
         # Remove stale incidents from dashboard that are no longer present in the current Sentinel view.
         keys = [x.get('incident_key') for x in snapshot]
-        self.store.sync_visible_incidents(keys, clear_when_empty=bool(keys))
+        clear_empty_view = bool(keys) or self.current_view_reports_no_incidents()
+        self.store.sync_visible_incidents(keys, clear_when_empty=clear_empty_view)
 
         total_ms = int((time.perf_counter() - start_scan) * 1000)
         try:
@@ -1825,9 +1934,9 @@ class SentinelPageBot:
         return scanned, processed
 
 
-class BotWorker(threading.Thread):
+class NotifierWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_bot=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.session_first_notified_keys=set()
+        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.session_first_notified_keys=set()
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
     def set_runtime_state(self, **changes):
         with self.state_lock:
@@ -1839,7 +1948,7 @@ class BotWorker(threading.Thread):
     def get_runtime_state(self):
         with self.state_lock:
             return {
-                'running_bot': self.running_bot,
+                'running_monitor': self.running_monitor,
                 'paused': self.paused,
                 'dry_run': self.dry_run,
                 'last_scan_ts': self.last_scan_ts,
@@ -1853,7 +1962,7 @@ class BotWorker(threading.Thread):
 
     def can_continue_flag(self):
         with self.state_lock:
-            return self.running_bot and not self.paused and not self.shutdown_requested and not self.stop_requested
+            return self.running_monitor and not self.paused and not self.shutdown_requested and not self.stop_requested
 
     def connect_browsers(self):
         log_file("BROWSER_CONNECT_START", '')
@@ -1884,7 +1993,7 @@ class BotWorker(threading.Thread):
     def restore_browser_window(self, page):
         """
         Kept as a best-effort background check.
-        We intentionally avoid forcing window focus now, so the bot can keep running
+        We intentionally avoid forcing window focus now, so the monitor can keep running
         while Chrome/Edge stay on another desktop or minimized.
         """
         for attempt in range(1, 4):
@@ -1925,7 +2034,7 @@ class BotWorker(threading.Thread):
         page=self.pages.get(self.target_page_id)
         if page is None:
             log_file("SELECTED_PAGE_FAIL", f"target={self.target_page_id};missing")
-            raise RuntimeError('Tab selezionata non piÃ¹ disponibile. Premi Refresh browser tabs.')
+            raise RuntimeError('Tab selezionata non piu disponibile. Premi Refresh browser tabs.')
         try:
             if page.is_closed():
                 log_file("SELECTED_PAGE_FAIL", f"target={self.target_page_id};closed")
@@ -2072,7 +2181,7 @@ class BotWorker(threading.Thread):
     def run_scan(self, fetch_only=False, force_first_alert_for_existing=False):
         """
         Runs exactly one browser operation at a time.
-        This prevents auto-fetch and bot actions from touching the same Sentinel tab together.
+        This prevents auto-fetch and monitor actions from touching the same Sentinel tab together.
         """
         run_id = int(time.time() * 1000)
         log_file("RUN_SCAN_CALL", f"run_id={run_id};fetch_only={fetch_only};force_first={force_first_alert_for_existing}")
@@ -2096,7 +2205,7 @@ class BotWorker(threading.Thread):
                 return 0, 0
 
             if (not fetch_only) and (not self.can_continue_flag()):
-                self.store.log_system('SCAN', 'SKIP_STOPPED', 'Bot stopped or paused before scan start')
+                self.store.log_system('SCAN', 'SKIP_STOPPED', 'Monitor stopped or paused before scan start')
                 log_file("RUN_SCAN_SKIP", f"run_id={run_id};reason=can_continue_false;fetch_only={fetch_only}")
                 self.set_runtime_state(operation_in_progress=False, operation_kind='')
                 return 0, 0
@@ -2110,14 +2219,14 @@ class BotWorker(threading.Thread):
 
             try:
                 run_started = time.perf_counter()
-                bot = SentinelPageBot(page, self.store, self.settings)
-                bot.can_continue = (
+                monitor = SentinelPageMonitor(page, self.store, self.settings)
+                monitor.can_continue = (
                     lambda: not self.get_runtime_state().get('shutdown_requested')
                     and not self.get_runtime_state().get('stop_requested')
                 ) if fetch_only else self.can_continue_flag
 
                 scan_start = time.perf_counter()
-                scanned, processed = bot.scan(state['dry_run'], fetch_only)
+                scanned, processed = monitor.scan(state['dry_run'], fetch_only)
                 scan_ms = int((time.perf_counter() - scan_start) * 1000)
                 log_file(
                     'SCAN_TIMING',
@@ -2206,14 +2315,14 @@ class BotWorker(threading.Thread):
             elif a == 'fetch':
                 # Manual fetch is allowed, but still serialized with every other browser operation.
                 state = self.get_runtime_state()
-                log_file("HANDLE_FETCH_STATE", f"running={state.get('running_bot')};paused={state.get('paused')};operation_in_progress={state.get('operation_in_progress')}")
+                log_file("HANDLE_FETCH_STATE", f"running={state.get('running_monitor')};paused={state.get('paused')};operation_in_progress={state.get('operation_in_progress')}")
                 if state.get('operation_in_progress'):
                     log_file("HANDLE_FETCH_SKIP", "operation_in_progress")
                     self.emit('status', {'message':'Operazione già in corso, attendi il completamento prima di un nuovo fetch.', 'settings':self.settings_dict()})
                     return
-                if state.get('running_bot') and not state.get('paused'):
-                    log_file("HANDLE_FETCH_SKIP", "bot_running")
-                    self.emit('status', {'message':'Fetch non disponibile mentre il bot è in esecuzione.', 'settings':self.settings_dict()})
+                if state.get('running_monitor') and not state.get('paused'):
+                    log_file("HANDLE_FETCH_SKIP", "monitor_running")
+                    self.emit('status', {'message':'Fetch non disponibile mentre il monitor è in esecuzione.', 'settings':self.settings_dict()})
                     return
                 self.set_runtime_state(stop_requested=False, starting=False)
                 log_file("HANDLE_FETCH", f"target={self.target_page_id}")
@@ -2230,39 +2339,39 @@ class BotWorker(threading.Thread):
                     return
                 self.set_runtime_state(stop_requested=False)
                 dry = bool(cmd.get('dry_run', True))
-                self.set_runtime_state(dry_run=dry, running_bot=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
-                self.store.log_system('BOT_START_REQUEST', 'RECEIVED', 'mode=' + ('dry-run' if dry else 'real'))
-                self.emit('status', {'message':'Initial fetch before bot start...', 'settings':self.settings_dict()})
+                self.set_runtime_state(dry_run=dry, running_monitor=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
+                self.store.log_system('monitor_START_REQUEST', 'RECEIVED', 'mode=' + ('dry-run' if dry else 'real'))
+                self.emit('status', {'message':'Initial fetch before monitor start...', 'settings':self.settings_dict()})
 
-                # Initial fetch first, then enable the real/dry-run bot.
+                # Initial fetch first, then enable the real/dry-run monitor.
                 self.run_scan(fetch_only=True, force_first_alert_for_existing=True)
                 if not self.get_runtime_state().get('shutdown_requested') and not self.get_runtime_state().get('stop_requested'):
-                    self.set_runtime_state(dry_run=dry, running_bot=True, paused=False, starting=False, auto_fetch_enabled=False, last_scan_ts=0)
-                    self.emit('status', {'message':'Bot started in '+('dry-run' if dry else 'real')+' mode after initial fetch', 'settings':self.settings_dict()})
-                    self.store.log_system('BOT_START', 'SUCCESS', 'mode=' + ('dry-run' if dry else 'real'))
+                    self.set_runtime_state(dry_run=dry, running_monitor=True, paused=False, starting=False, auto_fetch_enabled=False, last_scan_ts=0)
+                    self.emit('status', {'message':'monitor started in '+('dry-run' if dry else 'real')+' mode after initial fetch', 'settings':self.settings_dict()})
+                    self.store.log_system('monitor_START', 'SUCCESS', 'mode=' + ('dry-run' if dry else 'real'))
                     log_file("HANDLE_START_OK", f"dry={dry}")
                 log_file("HANDLE_START_DONE", f"state={self.get_runtime_state()}")
 
             elif a == 'pause':
                 self.set_runtime_state(paused=True, auto_fetch_enabled=False)
-                self.store.log_system('BOT_PAUSE', 'SUCCESS', '')
-                self.emit('status', {'message':'Bot paused. Auto-fetch disabled.', 'settings':self.settings_dict()})
+                self.store.log_system('monitor_PAUSE', 'SUCCESS', '')
+                self.emit('status', {'message':'Monitor paused. Auto-fetch disabled.', 'settings':self.settings_dict()})
                 log_file("HANDLE_PAUSE", "")
 
             elif a == 'resume':
                 self.set_runtime_state(stop_requested=False)
-                self.set_runtime_state(paused=False, running_bot=True, auto_fetch_enabled=False)
-                self.store.log_system('BOT_RESUME', 'SUCCESS', '')
-                self.emit('status', {'message':'Bot resumed. Auto-fetch disabled while bot is running.', 'settings':self.settings_dict()})
+                self.set_runtime_state(paused=False, running_monitor=True, auto_fetch_enabled=False)
+                self.store.log_system('monitor_RESUME', 'SUCCESS', '')
+                self.emit('status', {'message':'Monitor resumed. Auto-fetch disabled while monitor is running.', 'settings':self.settings_dict()})
                 log_file("HANDLE_RESUME", "")
                 log_file("HANDLE_RESUME_DONE", f"state={self.get_runtime_state()}")
 
             elif a == 'stop':
-                # Stop means stop bot and stop background auto-fetch.
-                self.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False, stop_requested=True)
+                # Stop means stop monitor and stop background auto-fetch.
+                self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, stop_requested=True)
                 self.session_first_notified_keys.clear()
-                self.store.log_system('BOT_STOP', 'SUCCESS', 'Bot stopped; auto-fetch disabled')
-                self.emit('status', {'message':'Bot stopped. Auto-fetch disabled; use FETCH CURRENT VIEW for manual refresh.', 'settings':self.settings_dict()})
+                self.store.log_system('monitor_STOP', 'SUCCESS', 'Monitor stopped; auto-fetch disabled')
+                self.emit('status', {'message':'Monitor stopped. Auto-fetch disabled; use FETCH CURRENT VIEW for manual refresh.', 'settings':self.settings_dict()})
                 log_file("HANDLE_STOP", "stop_requested=true")
                 log_file("HANDLE_STOP_DONE", f"state={self.get_runtime_state()}")
 
@@ -2290,7 +2399,7 @@ class BotWorker(threading.Thread):
                 log_file("HANDLE_UNIGNORE_ALL", "")
 
             elif a == 'shutdown':
-                self.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
+                self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
                 self.session_first_notified_keys.clear()
                 self.store.log_system('APP_SHUTDOWN', 'REQUESTED', '')
                 self.cleanup_playwright()
@@ -2304,7 +2413,7 @@ class BotWorker(threading.Thread):
             self.emit('error', {'message': details, 'actions': self.store.actions()})
 
     def run(self):
-        self.emit('status', {'message':'Worker ready. Click Launch Chrome/Edge for bot: the app will open and auto-link the new tab.','settings':self.settings_dict()})
+        self.emit('status', {'message':'Worker ready. Click Launch Chrome/Edge for monitor: the app will open and auto-link the new tab.','settings':self.settings_dict()})
         self.store.log_system('WORKER', 'READY', '')
         while True:
             try:
@@ -2318,12 +2427,12 @@ class BotWorker(threading.Thread):
                 if state.get('shutdown_requested'):
                     break
 
-                # Auto-fetch runs only when explicitly enabled and when the bot is fully stopped.
-                # It never runs while starting/running/paused to avoid touching the same tab together with the bot.
+                # Auto-fetch runs only when explicitly enabled and when the monitor is fully stopped.
+                # It never runs while starting/running/paused to avoid touching the same tab together with the monitor.
                 state = self.get_runtime_state()
                 if (
                     state.get('auto_fetch_enabled')
-                    and not state.get('running_bot')
+                    and not state.get('running_monitor')
                     and not state.get('paused')
                     and not state.get('starting')
                     and not state.get('operation_in_progress')
@@ -2337,7 +2446,7 @@ class BotWorker(threading.Thread):
 
                 state = self.get_runtime_state()
                 if (
-                    state.get('running_bot')
+                    state.get('running_monitor')
                     and not state.get('paused')
                     and not state.get('starting')
                     and not state.get('operation_in_progress')
@@ -2345,7 +2454,7 @@ class BotWorker(threading.Thread):
                     and time.time() - state.get('last_scan_ts', 0) >= self.settings.scan_interval_seconds
                 ):
                     self.set_runtime_state(last_scan_ts=time.time())
-                    self.emit('status', {'message':'Automatic bot scan running...', 'settings':self.settings_dict()})
+                    self.emit('status', {'message':'Automatic monitor scan running...', 'settings':self.settings_dict()})
                     log_file("RUN_LOOP_TRIGGER", f"auto_scan_interval={self.settings.scan_interval_seconds};target={self.target_page_id}")
                     self.run_scan(fetch_only=False)
 
@@ -2357,7 +2466,7 @@ class BotWorker(threading.Thread):
                 except Exception:
                     pass
                 if 'Tab selezionata' in str(e):
-                    self.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False)
+                    self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False)
                     self.target_page_id = None
                     self.emit('status', {'message':'Browser tab disconnected: please refresh pages and re-select a Sentinel tab.', 'settings': self.settings_dict()})
                 self.emit('error', {'message': details, 'actions': self.store.actions() if hasattr(self, 'store') else []})
@@ -2387,13 +2496,12 @@ def _debug_port_alive(port):
 def launch_browser_debug(browser):
     """
     Avvia un'istanza Chromium debuggabile e separata dalle finestre normali.
-    Questo evita il problema principale: se Chrome Ã¨ giÃ  aperto normalmente,
+    Questo evita il problema principale: se Chrome e' gia' aperto normalmente,
     Windows/Chrome tende a riusare il processo esistente e la porta 9222 non viene attivata.
     """
     exe=find_chrome_path() if browser=='chrome' else find_edge_path()
     port=CHROME_DEBUG_PORT if browser=='chrome' else EDGE_DEBUG_PORT
-    profile_name='chrome_bot_profile' if browser=='chrome' else 'edge_bot_profile'
-    profile_dir=(BROWSER_PROFILE_DIR/profile_name).resolve()
+    profile_dir=browser_profile_dir(browser)
 
     if not exe:
         messagebox.showerror('Browser non trovato', f'{browser} non trovato.')
@@ -2413,6 +2521,8 @@ def launch_browser_debug(browser):
         f'--user-data-dir={str(profile_dir)}',
         '--no-first-run',
         '--no-default-browser-check',
+        '--restore-last-session',
+        '--hide-crash-restore-bubble',
         '--start-minimized',
         '--new-window',
         '--disable-backgrounding-occluded-windows',
@@ -2432,10 +2542,11 @@ def launch_browser_debug(browser):
         messagebox.showerror('Errore avvio browser', str(e))
         return False
 
-class BotApp(tk.Tk):
+class NotifierApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Sentinel Auto Assign Bot - Desktop (UI UX Pro Max)')
+        enable_windows_background_runtime()
+        self.title('Sentinel Notifier - Desktop (UI UX Pro Max)')
         self.geometry('1280x860')
         self.protocol('WM_DELETE_WINDOW', self.on_close)
         self.minsize(1020,680)
@@ -2453,7 +2564,7 @@ class BotApp(tk.Tk):
         self.out_q=queue.Queue()
         log_file("APP_QUEUES_READY", f"in_q_size={self.in_q.qsize()};out_q_size={self.out_q.qsize()}")
         set_windows_notification_action_sink(self._enqueue_windows_action)
-        self.worker=BotWorker(self.in_q,self.out_q,self.store)
+        self.worker=NotifierWorker(self.in_q,self.out_q,self.store)
         log_file("APP_WORKER_CREATED", "")
         self.worker.start()
         log_file("APP_WORKER_STARTED", "")
@@ -2548,7 +2659,7 @@ class BotApp(tk.Tk):
 
         hero = ttk.Frame(root, style='HeaderAccent.TFrame', padding=(14, 10))
         hero.pack(fill='x', pady=(0, 12))
-        ttk.Label(hero, text='Sentinel Auto Assign Bot', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(hero, text='Sentinel Notifier', style='Title.TLabel').pack(anchor='w')
         ttk.Label(
             hero,
             text='Dashboard semplificata: 3 blocchi in alto, incidenti in basso',
@@ -2586,8 +2697,8 @@ class BotApp(tk.Tk):
 
         workspace = ttk.LabelFrame(top_grid, text='Workspace', style='Card.TLabelframe', padding=14)
         workspace.grid(row=0, column=0, sticky='nsew', padx=(0, 8))
-        bot = ttk.LabelFrame(top_grid, text='Stato bot', style='Card.TLabelframe', padding=14)
-        bot.grid(row=0, column=1, sticky='nsew', padx=(0, 8))
+        monitor = ttk.LabelFrame(top_grid, text='Stato notifier', style='Card.TLabelframe', padding=14)
+        monitor.grid(row=0, column=1, sticky='nsew', padx=(0, 8))
         sla = ttk.LabelFrame(top_grid, text='SLA', style='Card.TLabelframe', padding=14)
         sla.grid(row=0, column=2, sticky='nsew')
 
@@ -2599,7 +2710,7 @@ class BotApp(tk.Tk):
 
         ttk.Label(
             workspace,
-            text='Seleziona la tab Sentinel aperta per agganciare il bot.',
+            text='Seleziona la tab Sentinel aperta per agganciare il monitor.',
             style='Section.TLabel'
         ).pack(anchor='w', pady=(8, 8))
         ws_btns = ttk.Frame(workspace, style='App.TFrame')
@@ -2615,30 +2726,30 @@ class BotApp(tk.Tk):
         self.pages_tree.pack(fill='both', expand=True, pady=(8, 0))
         self.pages_tree.bind('<<TreeviewSelect>>', self.on_page_select)
 
-        bot_kpis = ttk.Frame(bot, style='App.TFrame')
-        bot_kpis.pack(fill='x')
-        ttk.Label(bot_kpis, text='Scan', style='Section.TLabel').grid(row=0, column=0, sticky='w')
-        ttk.Label(bot_kpis, textvariable=self.auto_check_text, style='KPIKey.TLabel').grid(row=0, column=1, sticky='w', padx=(6, 16))
-        ttk.Label(bot_kpis, text='Auto fetch', style='Section.TLabel').grid(row=0, column=2, sticky='w')
-        ttk.Label(bot_kpis, textvariable=self.auto_fetch_text, style='KPIKey.TLabel').grid(row=0, column=3, sticky='w')
+        monitor_kpis = ttk.Frame(monitor, style='App.TFrame')
+        monitor_kpis.pack(fill='x')
+        ttk.Label(monitor_kpis, text='Scan', style='Section.TLabel').grid(row=0, column=0, sticky='w')
+        ttk.Label(monitor_kpis, textvariable=self.auto_check_text, style='KPIKey.TLabel').grid(row=0, column=1, sticky='w', padx=(6, 16))
+        ttk.Label(monitor_kpis, text='Auto fetch', style='Section.TLabel').grid(row=0, column=2, sticky='w')
+        ttk.Label(monitor_kpis, textvariable=self.auto_fetch_text, style='KPIKey.TLabel').grid(row=0, column=3, sticky='w')
 
-        bot_btns = ttk.Frame(bot, style='App.TFrame')
-        bot_btns.pack(fill='x', pady=(12, 0))
+        monitor_btns = ttk.Frame(monitor, style='App.TFrame')
+        monitor_btns.pack(fill='x', pady=(12, 0))
         for text, cmd in [
-            ('START REAL BOT', lambda: self.start_bot(False)),
-            ('START DRY-RUN', lambda: self.start_bot(True)),
+            ('START MONITOR', lambda: self.start_monitor(False)),
+            ('DRY-RUN', lambda: self.start_monitor(True)),
             ('FETCH CURRENT VIEW', lambda: self.send('fetch')),
-            ('PAUSE', self.pause_bot),
-            ('RESUME', self.resume_bot),
-            ('STOP', self.stop_bot)
+            ('PAUSE', self.pause_monitor),
+            ('RESUME', self.resume_monitor),
+            ('STOP', self.stop_monitor)
         ]:
             style = 'Primary.TButton' if text.startswith('START') else 'Danger.TButton' if text == 'STOP' else 'Secondary.TButton'
-            ttk.Button(bot_btns, text=text, style=style, command=cmd).pack(side='left', padx=(0, 8), pady=(0, 8))
+            ttk.Button(monitor_btns, text=text, style=style, command=cmd).pack(side='left', padx=(0, 8), pady=(0, 8))
 
-        bot_extra = ttk.Frame(bot, style='App.TFrame')
-        bot_extra.pack(fill='x', pady=(8, 0))
-        ttk.Button(bot_extra, text='IGNORE SELECTED', style='Secondary.TButton', command=self.ignore_selected_incident).pack(side='left', padx=(0, 8))
-        ttk.Button(bot_extra, text='UNIGNORE ALL', style='Secondary.TButton', command=self.unignore_all_incidents).pack(side='left')
+        monitor_extra = ttk.Frame(monitor, style='App.TFrame')
+        monitor_extra.pack(fill='x', pady=(8, 0))
+        ttk.Button(monitor_extra, text='IGNORE SELECTED', style='Secondary.TButton', command=self.ignore_selected_incident).pack(side='left', padx=(0, 8))
+        ttk.Button(monitor_extra, text='UNIGNORE ALL', style='Secondary.TButton', command=self.unignore_all_incidents).pack(side='left')
 
         self.sla_vars = {
             'sla_critical_minutes': tk.IntVar(value=30), 'sla_high_minutes': tk.IntVar(value=30), 'sla_medium_minutes': tk.IntVar(value=60), 'sla_low_minutes': tk.IntVar(value=60), 'sla_informational_minutes': tk.IntVar(value=60),
@@ -2779,7 +2890,7 @@ class BotApp(tk.Tk):
         self.pending_auto_attempts=8
         self.status_var.set(f"{self.pending_auto_browser} avviato. Collegamento automatico in corso...")
 
-        # Prova piÃ¹ volte: Chrome/Edge puÃ² impiegare alcuni secondi prima di esporre la porta CDP.
+        # Prova piu' volte: Chrome/Edge puo' impiegare alcuni secondi prima di esporre la porta CDP.
         for delay in (1500, 3000, 5000, 8000, 12000, 16000, 20000):
             self.after(delay, lambda:self.send('refresh_pages'))
 
@@ -2787,7 +2898,7 @@ class BotApp(tk.Tk):
     def on_close(self):
         log_file("UI_CLOSE", "requested")
         try:
-            self.worker.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
+            self.worker.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
         except Exception:
             pass
 
@@ -2811,28 +2922,28 @@ class BotApp(tk.Tk):
         self.after(1200, _finish_close)
 
 
-    def start_bot(self, dry_run):
+    def start_monitor(self, dry_run):
         log_file("UI_START", f"dry={dry_run}")
-        self.worker.set_runtime_state(dry_run=bool(dry_run), running_bot=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
-        self.status_var.set('Starting bot: initial fetch first...')
+        self.worker.set_runtime_state(dry_run=bool(dry_run), running_monitor=False, paused=False, starting=True, auto_fetch_enabled=False, last_scan_ts=0)
+        self.status_var.set('Starting monitor: initial fetch first...')
         self.send('start', dry_run=dry_run)
 
-    def pause_bot(self):
+    def pause_monitor(self):
         log_file("UI_PAUSE", "")
         self.worker.set_runtime_state(paused=True, auto_fetch_enabled=False)
-        self.status_var.set('Bot paused. Auto-fetch disabled.')
+        self.status_var.set('Monitor paused. Auto-fetch disabled.')
         self.send('pause')
 
-    def resume_bot(self):
+    def resume_monitor(self):
         log_file("UI_RESUME", "")
-        self.worker.set_runtime_state(paused=False, running_bot=True, auto_fetch_enabled=False)
-        self.status_var.set('Bot resumed.')
+        self.worker.set_runtime_state(paused=False, running_monitor=True, auto_fetch_enabled=False)
+        self.status_var.set('Monitor resumed.')
         self.send('resume')
 
-    def stop_bot(self):
+    def stop_monitor(self):
         log_file("UI_STOP", "")
-        self.worker.set_runtime_state(running_bot=False, paused=False, starting=False, auto_fetch_enabled=False)
-        self.status_var.set('Bot stopped. Auto-fetch disabled.')
+        self.worker.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False)
+        self.status_var.set('Monitor stopped. Auto-fetch disabled.')
         self.send('stop')
 
     def ignore_selected_incident(self):
@@ -3069,10 +3180,11 @@ class BotApp(tk.Tk):
                         self.status_var.set(f"Notifica Windows {action} - {sev.upper()} {msg.get('incident_key','-')}")
                 elif kind=='error':
                     log_file("UI_POLL", f"kind=error;message={msg.get('message','')[:120]}")
-                    self.status_var.set('ERROR: '+msg.get('message','')); self.refresh_actions(msg.get('actions',[])); messagebox.showwarning('Bot error', msg.get('message','Unknown error'))
+                    self.status_var.set('ERROR: '+msg.get('message','')); self.refresh_actions(msg.get('actions',[])); messagebox.showwarning('monitor error', msg.get('message','Unknown error'))
         except queue.Empty: pass
         self.after(700,self.poll_worker)
 
-if __name__=='__main__': BotApp().mainloop()
+if __name__=='__main__': NotifierApp().mainloop()
+
 
 

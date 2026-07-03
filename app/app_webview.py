@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import importlib.util
 import copy
 import queue
@@ -40,8 +40,7 @@ def _launch_browser_process(browser):
     except Exception:
         pass
 
-    profile_name = "chrome_bot_profile" if browser == "chrome" else "edge_bot_profile"
-    profile_dir = (core.BROWSER_PROFILE_DIR / profile_name).resolve()
+    profile_dir = core.browser_profile_dir(browser)
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     args = [
@@ -52,6 +51,8 @@ def _launch_browser_process(browser):
         f"--user-data-dir={str(profile_dir)}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--restore-last-session",
+        "--hide-crash-restore-bubble",
         "--start-minimized",
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -94,7 +95,7 @@ class WebViewApi:
             return self.worker.get_runtime_state()
         except Exception:
             return {
-                "running_bot": False,
+                "running_monitor": False,
                 "paused": False,
                 "dry_run": True,
                 "last_scan_ts": 0,
@@ -235,10 +236,17 @@ def _build_window_html():
 def run_webview(debug=False):
     import webview
 
+    core.enable_windows_background_runtime()
     store = core.Storage(core.DB_PATH)
+    try:
+        store.clear_runtime_data()
+        core.log_file("WEBVIEW_DB_CLEAR", "startup clear runtime tables requested and completed")
+    except Exception as exc:
+        core.log_file("WEBVIEW_DB_CLEAR_FAIL", "startup clear runtime tables failed", exc)
+
     in_q = queue.Queue()
     out_q = queue.Queue()
-    worker = core.BotWorker(in_q, out_q, store)
+    worker = core.NotifierWorker(in_q, out_q, store)
     worker.start()
 
     api = WebViewApi(store, worker, in_q, out_q)
@@ -246,7 +254,7 @@ def run_webview(debug=False):
 
     html = _build_window_html()
     window = webview.create_window(
-        "Sentinel Auto Assign Bot",
+        "Sentinel Notifier",
         html=html,
         js_api=api,
         width=1550,
@@ -269,14 +277,14 @@ def run_webview(debug=False):
 
 
 def run_tk():
-    app = core.BotApp()
+    app = core.NotifierApp()
     app.mainloop()
     return app
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sentinel Auto Assign Bot launcher")
-    parser.add_argument("--ui", default="webview", choices=("webview", "tk"), help="Modalità UI")
+    parser = argparse.ArgumentParser(description="Sentinel Notifier launcher")
+    parser.add_argument("--ui", default="webview", choices=("webview", "tk"), help="Modalita UI")
     parser.add_argument("--debug", action="store_true", help="Abilita debug nel wrapper webview")
     args = parser.parse_args()
 
@@ -291,3 +299,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -1,18 +1,18 @@
-﻿# Sentinel Auto Assigner
+﻿# Sentinel Notifier
 
-Desktop app per monitorare e auto-assegnare incident in Microsoft Sentinel / Defender via UI web automatizzata.
+Desktop app per monitorare incident in Microsoft Sentinel / Defender via UI web automatizzata.
 
 ## Stato attuale (principali caratteristiche)
 
 - Interfaccia desktop (pywebview) con:
-  - stato bot (start/pause/stop),
+  - Stato notifier (start/pause/stop),
   - elenco incident in tempo reale,
   - log delle azioni,
   - impostazioni SLA/notification/refresh.
 - Collegamento ad una tab Sentinel gia' aperta tramite CDP (chrome/edge debug).
 - Notifiche Windows per nuovi alert e alert con SLA vicino alla soglia.
-- Supporto fetch manuale e auto-fetch periodico (solo quando non in esecuzione bot).
-- modalita' background-friendly: se Chrome/Edge sono gia' avviati sulla porta debug, l'app non rilancia piu' automaticamente il browser.
+- Supporto fetch manuale e auto-fetch periodico (solo quando non in esecuzione monitor).
+- Modalita' background-friendly: se Chrome/Edge sono gia' avviati sulla porta debug, l'app non rilancia piu' automaticamente il browser.
 
 ## Requisiti
 
@@ -24,13 +24,13 @@ Desktop app per monitorare e auto-assegnare incident in Microsoft Sentinel / Def
 ## Struttura repository
 
 ```text
-Sentinel Autoassigner/
+Sentinel Notifier/
   app/
     app.py
     app_webview.py
     requirements.txt
-  install_sentinel_autoassigner_windows.bat
-  start_sentinel_autoassigner_windows.bat
+  install_sentinel_notifier_windows.bat
+  start_sentinel_notifier_windows.bat
   README.md
 ```
 
@@ -40,7 +40,7 @@ Sentinel Autoassigner/
 2. Esegui:
 
 ```bat
-install_sentinel_autoassigner_windows.bat
+install_sentinel_notifier_windows.bat
 ```
 
 Lo script esegue:
@@ -51,7 +51,7 @@ Lo script esegue:
 ## Avvio
 
 ```bat
-start_sentinel_autoassigner_windows.bat
+start_sentinel_notifier_windows.bat
 ```
 
 Il batch avvia l'app con `pythonw` e UI webview.
@@ -61,7 +61,7 @@ Il batch avvia l'app con `pythonw` e UI webview.
 1. Avvia Chrome/Edge debug dal pulsante della UI (o assicurati che sia gia' attiva sulla porta corretta).
 2. Premere `Refresh browser tabs`.
 3. Selezionare la tab Sentinel.
-4. Avviare il bot (`Start` dry-run o reale).
+4. Avviare il monitor (`Start` dry-run o reale).
 
 ## Panoramica dettagliata UI
 
@@ -80,11 +80,11 @@ La finestra principale e' divisa in blocchi funzionali per separare controllo, s
     - Titolo e URL
   - Selezionando una riga, l'app imposta la tab target per fetch/scan.
 
-- **Controllo bot e stato esecuzione**
+- **Controllo monitor e stato esecuzione**
   - `Start (dry-run)` e `Start (reale)`: avviano il ciclo automatico con primo fetch immediato.
   - `Pause` / `Resume`: mettono in pausa l'esecuzione automatica senza cancellare lo stato.
-  - `Stop`: ferma bot, auto-fetch e loop operativi.
-  - `FETCH CURRENT VIEW NOW`: forza una lettura immediata della vista corrente (solo quando il bot non sta processando).
+  - `Stop`: ferma monitor, auto-fetch e loop operativi.
+  - `FETCH CURRENT VIEW NOW`: forza una lettura immediata della vista corrente (solo quando il monitor non sta processando).
 
 - **Blocchi SLA / impostazioni avanzate**
   - Card dedicata ai threshold:
@@ -110,7 +110,7 @@ La finestra principale e' divisa in blocchi funzionali per separare controllo, s
 - **Tab Azioni/Log**
   - Log cronologico di tutte le azioni principali:
     - fetch/scan
-    - assignment
+    - notification workflow
     - stato active
     - notifiche sent/sentenza
   - Utile per audit e diagnostica rapida.
@@ -121,25 +121,25 @@ La finestra principale e' divisa in blocchi funzionali per separare controllo, s
 2. Lancio/connessione browser debug.
 3. Refresh tab e selezione della pagina Sentinel corretta.
 4. Settaggio intervalli (opzionale) e check SLA.
-5. Start dry-run per verifica senza modifiche.
+5. DRY-RUN per verifica senza modifiche.
 6. Passaggio a start reale quando la lista si comporta correttamente.
 
 ## Come leggere i campi chiave
 
-- **Status bot**: riflette direttamente lo stato del runtime (`running`, `paused`, `starting`, `stop`) ed evita conflitti tra scan automatici e fetch manuali.
+- **Status monitor**: riflette direttamente lo stato del runtime (`running`, `paused`, `starting`, `stop`) ed evita conflitti tra scan automatici e fetch manuali.
 - **AUTO-FETCH / SCAN**:
-  - Auto-fetch: leggeri refetch su tab selezionata quando il bot e' fermo.
-  - Scan: ciclo automatico completo quando bot in run con intervallo `Scan interval (s)`.
+  - Auto-fetch: leggeri refetch su tab selezionata quando il monitor e' fermo.
+  - Scan: ciclo automatico completo quando monitor in run con intervallo `Scan interval (s)`.
 - **Incident row status**:
   - `new active/closed` visibile nel campo stato.
   - owner e percentuale di ETA sono aggiornati dopo refresh.
 - **SLA columns**:
   - il valore mostrato e' il tempo residuo in minuti verso la soglia corrente della severita' impostata.
 
-### Opzioni bot
+### Opzioni monitor
 
 - **Fetch current view**: forza una lettura rapida della vista attiva.
-- **Stop**: ferma completamente bot e auto-fetch.
+- **Stop**: ferma completamente monitor e auto-fetch.
 - **Settings**: aggiorna SLA (taking charge, notification, resolution), % notifiche e intervalli.
 
 ## Nota comportamento background (Chrome/Edge)
@@ -148,11 +148,15 @@ L'app ora:
 - evita di riaprire il browser se la porta CDP e' gia' attiva (`9222` per Chrome, `9223` per Edge);
 - non forza piu' il focus della finestra browser durante le operazioni;
 - puo' continuare a lavorare anche se browser e' minimizzato o su un altro desktop.
+- mantiene Windows sveglio mentre l'app e' in esecuzione, cosi' il monitor continua anche a sessione bloccata se il PC non viene spento/ibernato.
+- usa un profilo browser persistente in `app/browser_profiles`, quindi cookie e sessione restano disponibili dopo riavvio PC finche' Azure/Defender non richiedono nuova autenticazione.
 
 Se il browser non si collega automaticamente:
 - verifica che il canale CDP sia aperto sulla porta giusta,
 - controlla che la tab selezionata sia effettivamente una pagina Sentinel,
 - premi nuovamente `Refresh browser tabs`.
+
+Nota: se il browser deve fare click su elementi della pagina mentre Windows e' bloccato, l'affidabilita' dipende dal rendering del portale e dalle policy Windows/azienda. La parte piu' stabile in background e' lettura/fetch/notifiche via CDP; per un servizio 24/7 pienamente affidabile servirebbe una integrazione API.
 
 ## File importanti
 
@@ -180,3 +184,4 @@ Se il browser non si collega automaticamente:
 ## Nota
 
 Questo repository non include dati sensibili: gli ambienti utente e i credenziali di accesso devono restare gestiti nel browser/sessione corrente di Sentinel.
+

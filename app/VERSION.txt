@@ -1,3 +1,4 @@
-Sentinel Auto Assign Bot - Desktop Final Visible Sync
+﻿Sentinel Notifier - Desktop Final Visible Sync
 Dashboard policy: mirror current Sentinel Incidents visible list after completed fetch/scan
 Closed/managed incidents no longer visible in Sentinel are removed locally and stop SLA notifications
+

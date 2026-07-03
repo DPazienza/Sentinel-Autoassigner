@@ -1,4 +1,4 @@
-@echo off
+﻿@echo off
 setlocal
 
 cd /d "%~dp0"
@@ -7,10 +7,11 @@ powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $
 
 if not exist ".venv\Scripts\pythonw.exe" (
     echo [ERROR] Virtual environment non trovato.
-    echo Esegui prima install_sentinel_autoassigner_windows.bat
+    echo Esegui prima install_sentinel_notifier_windows.bat
     pause
     exit /b 1
 )
 
 start "" ".venv\Scripts\pythonw.exe" "%~dp0app\app_webview.py" --ui webview
 exit /b 0
+
