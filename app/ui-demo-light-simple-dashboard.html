@@ -352,9 +352,7 @@
           <button class="btn ghost" id="openSentinelBtn">Apri Sentinel</button>
         </div>
         <ul class="workspace-list" id="workspaceList">
-          <li>Sentinel Portal: 3 tab attive</li>
-          <li>Jira Workspace: 1 tab</li>
-          <li>Ultima sync: 10:24</li>
+          <li>In attesa del collegamento al backend...</li>
         </ul>
             <div class="matrix" style="margin-top: 10px;">
               <div class="table-wrap" style="border: 0; border-radius: 0;">
@@ -769,18 +767,38 @@
 
     async function apiCall(name, ...args) {
       if (!window.pywebview || !window.pywebview.api || typeof window.pywebview.api[name] !== 'function') {
+        const badge = document.getElementById('runtimeBadge');
+        if (badge) badge.textContent = 'Bridge UI non pronto, attendi qualche secondo...';
         return { ok: false, error: 'bridge_not_ready' };
       }
-      return await window.pywebview.api[name](...args);
+      try {
+        const result = await window.pywebview.api[name](...args);
+        if (result && result.ok === false && result.error) {
+          const badge = document.getElementById('runtimeBadge');
+          if (badge) badge.textContent = result.error;
+        }
+        return result;
+      } catch (error) {
+        const badge = document.getElementById('runtimeBadge');
+        if (badge) badge.textContent = `Errore UI: ${error?.message || error}`;
+        return { ok: false, error: String(error?.message || error) };
+      }
     }
 
+    let refreshInProgress = false;
     async function refreshState() {
+      if (refreshInProgress) return;
+      refreshInProgress = true;
+      try {
       const state = await apiCall('get_state');
       if (!state) return;
 
-      const { status, runtime = {}, settings = {}, pages = [], connected = [], incidents = [], actions = [] } = state;
+      const { status, runtime = {}, settings = {}, pages = [], connected = [], incidents = [], actions = [], worker_alive = true } = state;
       if (status) {
         document.getElementById('runtimeBadge').textContent = status;
+      }
+      if (worker_alive === false) {
+        document.getElementById('runtimeBadge').textContent = "Worker non attivo: riavvia l'app.";
       }
 
       isPaused = !!runtime.paused;
@@ -793,6 +811,9 @@
       renderPagesList(pages);
       renderIncidents(incidents);
       renderActions(actions);
+      } finally {
+        refreshInProgress = false;
+      }
     }
 
     const tabs = document.querySelectorAll('.tab-btn');

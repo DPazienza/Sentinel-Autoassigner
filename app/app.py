@@ -893,19 +893,18 @@ def runtime_settings_from_storage(store):
         'notification_warning_percent','notification_repeat_minutes','auto_fetch_interval_seconds'
     ]:
         default = getattr(s, key)
+        lo, hi = 1, 10080
         if key in saved:
             if key == 'auto_fetch_interval_seconds':
-                lo, hi = 30, 3600
+                lo, hi = 60, 3600
             elif key == 'scan_interval_seconds':
-                lo, hi = 30, 3600
+                lo, hi = 60, 3600
             elif key == 'misclassification_percent':
                 lo, hi = 0, 100
             elif key == 'notification_warning_percent':
                 lo, hi = 1, 100
             elif key == 'notification_repeat_minutes':
                 lo, hi = 1, 10080
-        else:
-            lo, hi = 1, 10080
         setattr(s, key, clamp_int(saved.get(key), default, lo, hi))
         if key in saved:
             log_file("RUNTIME_SETTING_APPLIED", f"{key}={getattr(s, key)};source={saved.get(key)}")
@@ -1936,7 +1935,7 @@ class SentinelPageMonitor:
 
 class NotifierWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.session_first_notified_keys=set()
+        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.last_operation_ok=True; self.session_first_notified_keys=set()
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
     def set_runtime_state(self, **changes):
         with self.state_lock:
@@ -1978,13 +1977,16 @@ class NotifierWorker(threading.Thread):
 
         for name,port in [('Chrome',CHROME_DEBUG_PORT),('Edge',EDGE_DEBUG_PORT)]:
             try:
+                if not _debug_port_alive(port):
+                    log_file("BROWSER_CONNECT_SKIP", f"name={name};port={port};reason=debug_port_not_alive")
+                    continue
                 log_file("BROWSER_CONNECT_TRY", f"name={name};port={port}")
-                br=self.playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}')
+                br=self.playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=10000)
                 self.browsers.append((name,br))
                 connected.append(name)
                 log_file("BROWSER_CONNECT_OK", f"{name}:port={port}")
-            except Exception:
-                log_file("BROWSER_CONNECT_FAIL", f"{name}:port={port}")
+            except Exception as exc:
+                log_file("BROWSER_CONNECT_FAIL", f"{name}:port={port};err={type(exc).__name__}: {exc}")
                 continue
         elapsed = int((time.perf_counter() - started) * 1000)
         log_file("BROWSER_CONNECT_DONE", f"connected={connected};elapsed_ms={elapsed}")
@@ -2018,7 +2020,17 @@ class NotifierWorker(threading.Thread):
         for bname,br in self.browsers:
             for cidx,ctx in enumerate(br.contexts):
                 for pidx,page in enumerate(ctx.pages):
-                    url=page.url or ''
+                    try:
+                        if hasattr(page, 'is_closed') and page.is_closed():
+                            log_file("REFRESH_PAGES_SKIP", f"browser={bname};context={cidx};page={pidx};reason=closed")
+                            continue
+                    except Exception:
+                        log_file("REFRESH_PAGES_SKIP", f"browser={bname};context={cidx};page={pidx};reason=closed_check_failed")
+                        continue
+                    try:
+                        url=page.url or ''
+                    except Exception:
+                        url=''
                     try: title=page.title()
                     except Exception: title=''
                     pid=f'{bname}:{cidx}:{pidx}:{abs(hash(url+title))}'; self.pages[pid]=page
@@ -2027,6 +2039,58 @@ class NotifierWorker(threading.Thread):
         sentinel_rows = sum(1 for r in rows if r.get('is_sentinel'))
         log_file("REFRESH_PAGES_DONE", f"rows={len(rows)};sentinel_rows={sentinel_rows};connected={connected}")
         self.emit('pages', {'pages':rows,'connected':connected})
+
+    def page_looks_like_sentinel(self, page):
+        try:
+            if hasattr(page, 'is_closed') and page.is_closed():
+                return False
+        except Exception:
+            return False
+        try:
+            url = page.url or ''
+        except Exception:
+            url = ''
+        try:
+            title = page.title() or ''
+        except Exception:
+            title = ''
+        text = f"{url} {title}".lower()
+        return 'portal.azure.com' in text or 'security.microsoft.com' in text or 'sentinel' in text
+
+    def recover_selected_page(self, reason):
+        old_target = self.target_page_id or ''
+        preferred_browser = old_target.split(':', 1)[0] if ':' in old_target else ''
+        log_file("SELECTED_PAGE_RECOVER_START", f"old_target={old_target};preferred_browser={preferred_browser};reason={reason}")
+        if reason in ('closed', 'closed_check_error', 'missing', 'scan_browser_error'):
+            try:
+                self.cleanup_playwright()
+                log_file("SELECTED_PAGE_RECOVER_RESET_PLAYWRIGHT", f"reason={reason}")
+            except Exception as exc:
+                log_file("SELECTED_PAGE_RECOVER_RESET_FAIL", f"reason={reason}", exc)
+        try:
+            self.refresh_pages()
+        except Exception as exc:
+            log_file("SELECTED_PAGE_RECOVER_REFRESH_FAIL", f"old_target={old_target};reason={reason}", exc)
+
+        candidates = []
+        for pid, page in list(self.pages.items()):
+            if self.page_looks_like_sentinel(page):
+                browser_name = pid.split(':', 1)[0] if ':' in pid else ''
+                priority = 0 if preferred_browser and browser_name == preferred_browser else 1
+                candidates.append((priority, pid, page))
+
+        if not candidates:
+            log_file("SELECTED_PAGE_RECOVER_FAIL", f"old_target={old_target};reason={reason};pages={len(self.pages)}")
+            return None
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        _, pid, page = candidates[0]
+        self.target_page_id = pid
+        self.store.log_system('SELECT_PAGE', 'AUTO_RECOVER', f'old={old_target};new={pid};reason={reason}')
+        self.emit('status', {'message':'Tab Sentinel recuperata automaticamente. Monitor ancora attivo.', 'settings': self.settings_dict()})
+        log_file("SELECTED_PAGE_RECOVER_OK", f"old_target={old_target};new_target={pid};reason={reason}")
+        return page
+
     def selected_page(self):
         if not self.target_page_id:
             log_file("SELECTED_PAGE_FAIL", "no_target")
@@ -2034,13 +2098,25 @@ class NotifierWorker(threading.Thread):
         page=self.pages.get(self.target_page_id)
         if page is None:
             log_file("SELECTED_PAGE_FAIL", f"target={self.target_page_id};missing")
+            recovered = self.recover_selected_page('missing')
+            if recovered is not None:
+                return recovered
             raise RuntimeError('Tab selezionata non piu disponibile. Premi Refresh browser tabs.')
         try:
             if page.is_closed():
                 log_file("SELECTED_PAGE_FAIL", f"target={self.target_page_id};closed")
+                recovered = self.recover_selected_page('closed')
+                if recovered is not None:
+                    return recovered
                 raise RuntimeError('Tab selezionata chiusa. Premi Refresh browser tabs e seleziona di nuovo Sentinel.')
         except AttributeError:
             pass
+        except Exception as exc:
+            log_file("SELECTED_PAGE_FAIL", f"target={self.target_page_id};closed_check_error", exc)
+            recovered = self.recover_selected_page('closed_check_error')
+            if recovered is not None:
+                return recovered
+            raise RuntimeError('Tab Sentinel non raggiungibile. Ritenta il refresh browser tabs.')
         log_file("SELECTED_PAGE_OK", f"target={self.target_page_id}")
         return page
     def settings_dict(self): return self.settings.__dict__.copy()
@@ -2056,9 +2132,9 @@ class NotifierWorker(threading.Thread):
         for key in int_fields:
             default = getattr(self.settings, key)
             if key == 'auto_fetch_interval_seconds':
-                lo, hi = 30, 3600
+                lo, hi = 60, 3600
             elif key == 'scan_interval_seconds':
-                lo, hi = 30, 3600
+                lo, hi = 60, 3600
             elif key == 'notification_warning_percent':
                 lo, hi = 1, 100
             elif key == 'notification_repeat_minutes':
@@ -2185,6 +2261,7 @@ class NotifierWorker(threading.Thread):
         """
         run_id = int(time.time() * 1000)
         log_file("RUN_SCAN_CALL", f"run_id={run_id};fetch_only={fetch_only};force_first={force_first_alert_for_existing}")
+        self.last_operation_ok = False
         with self.operation_lock:
             if self.operation_in_progress:
                 self.store.log_system('SCAN', 'SKIP_BUSY', f'fetch_only={fetch_only}')
@@ -2210,12 +2287,21 @@ class NotifierWorker(threading.Thread):
                 self.set_runtime_state(operation_in_progress=False, operation_kind='')
                 return 0, 0
 
-            page = self.selected_page()
-            if not self.restore_browser_window(page):
-                self.store.log_system('SCAN', 'WINDOW_RESTORE_FAIL', 'Continuing without explicit restore')
-                log_file("RUN_SCAN_CONTINUE", f"run_id={run_id};reason=restore_browser_window_failed;fetch_only={fetch_only}")
-            self.store.log_system('FETCH' if fetch_only else 'SCAN', 'START', f'url={getattr(page, "url", "")}')
-            log_file("RUN_SCAN_START", f"run_id={run_id};fetch_only={fetch_only};url={getattr(page,'url','')}")
+            try:
+                page = self.selected_page()
+                if not self.restore_browser_window(page):
+                    self.store.log_system('SCAN', 'WINDOW_RESTORE_FAIL', 'Continuing without explicit restore')
+                    log_file("RUN_SCAN_CONTINUE", f"run_id={run_id};reason=restore_browser_window_failed;fetch_only={fetch_only}")
+                self.store.log_system('FETCH' if fetch_only else 'SCAN', 'START', f'url={getattr(page, "url", "")}')
+                log_file("RUN_SCAN_START", f"run_id={run_id};fetch_only={fetch_only};url={getattr(page,'url','')}")
+            except Exception as e:
+                details = f'fetch_only={fetch_only}; error={type(e).__name__}: {e}'
+                log_file('RUN_SCAN_TARGET_ERROR', details, e)
+                self.store.log_system('FETCH' if fetch_only else 'SCAN', 'TARGET_ERROR', details)
+                self.emit('status', {'message':'Tab Sentinel non disponibile: ritento automaticamente al prossimo ciclo.', 'settings': self.settings_dict()})
+                self.emit('error', {'message': details, 'actions': self.store.actions()})
+                self.set_runtime_state(operation_in_progress=False, operation_kind='')
+                return 0, 0
 
             try:
                 run_started = time.perf_counter()
@@ -2257,6 +2343,7 @@ class NotifierWorker(threading.Thread):
                     'message': f"{'Fetch' if fetch_only else 'Scan'} completato: {scanned} eventi, {processed} processati, {warnings} avvisi",
                     'settings': self.settings_dict()
                 })
+                self.last_operation_ok = True
                 log_file("RUN_SCAN_SUCCESS", f"run_id={run_id};fetch_only={fetch_only};scanned={scanned};processed={processed};warnings={warnings};kind={state.get('operation_kind')}")
                 log_file("RUN_SCAN_STATE", f"run_id={run_id};state={self.get_runtime_state()}")
                 return scanned, processed
@@ -2265,6 +2352,10 @@ class NotifierWorker(threading.Thread):
                 details = f'fetch_only={fetch_only}; error={type(e).__name__}: {e}'
                 log_file('RUN_SCAN_ERROR', details, e)
                 self.store.log_system('FETCH' if fetch_only else 'SCAN', 'ERROR', details)
+                err_text = str(e).lower()
+                if any(token in err_text for token in ('target page', 'page closed', 'browser has been closed', 'context has been closed', 'target closed', 'cdp', 'connection closed')):
+                    recovered = self.recover_selected_page('scan_browser_error')
+                    log_file("RUN_SCAN_RECOVER_AFTER_ERROR", f"run_id={run_id};recovered={bool(recovered)};target={self.target_page_id}")
                 self.emit('error', {'message': details, 'actions': self.store.actions()})
                 self.emit('status', {'message': f"{'Fetch' if fetch_only else 'Scan'} fallito: {type(e).__name__}", 'settings': self.settings_dict()})
                 log_file("RUN_SCAN_ERROR", f"{type(e).__name__}")
@@ -2304,7 +2395,9 @@ class NotifierWorker(threading.Thread):
         try:
             if a == 'refresh_pages':
                 log_file("HANDLE_REFRESH_PAGES", "")
+                self.emit('status', {'message':'Aggiornamento tab browser in corso...', 'settings':self.settings_dict()})
                 self.refresh_pages()
+                self.emit('status', {'message':'Tab browser aggiornate.', 'settings':self.settings_dict()})
 
             elif a == 'select_page':
                 self.target_page_id = cmd.get('page_id')
@@ -2345,6 +2438,12 @@ class NotifierWorker(threading.Thread):
 
                 # Initial fetch first, then enable the real/dry-run monitor.
                 self.run_scan(fetch_only=True, force_first_alert_for_existing=True)
+                if not self.last_operation_ok:
+                    self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False)
+                    self.store.log_system('monitor_START', 'BLOCKED', 'Initial fetch failed; monitor not started')
+                    self.emit('status', {'message':'Monitor non avviato: fetch iniziale fallito o tab Sentinel non disponibile.', 'settings':self.settings_dict()})
+                    log_file("HANDLE_START_BLOCKED", f"reason=initial_fetch_failed;target={self.target_page_id}")
+                    return
                 if not self.get_runtime_state().get('shutdown_requested') and not self.get_runtime_state().get('stop_requested'):
                     self.set_runtime_state(dry_run=dry, running_monitor=True, paused=False, starting=False, auto_fetch_enabled=False, last_scan_ts=0)
                     self.emit('status', {'message':'monitor started in '+('dry-run' if dry else 'real')+' mode after initial fetch', 'settings':self.settings_dict()})

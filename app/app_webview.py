@@ -125,47 +125,60 @@ class WebViewApi:
                 msg = self.out_q.get(timeout=0.4)
             except queue.Empty:
                 continue
+            except Exception as exc:
+                core.log_file("WEBVIEW_DRAIN_QUEUE_FAIL", str(exc), exc)
+                continue
 
-            kind = msg.get("kind")
-            with self._lock:
-                if kind == "pages":
-                    self._state["pages"] = msg.get("pages", [])
-                    self._state["connected"] = msg.get("connected", [])
-                    self._state["selected_page_id"] = self.worker.target_page_id
+            try:
+                kind = msg.get("kind")
+                with self._lock:
+                    if kind == "pages":
+                        self._state["pages"] = msg.get("pages", [])
+                        self._state["connected"] = msg.get("connected", [])
+                        self._state["selected_page_id"] = self.worker.target_page_id
 
-                elif kind == "status":
-                    self._state["status"] = msg.get("message", "")
-                    settings = msg.get("settings")
-                    if isinstance(settings, dict):
-                        self._state["settings"] = settings
+                    elif kind == "status":
+                        self._state["status"] = msg.get("message", "")
+                        settings = msg.get("settings")
+                        if isinstance(settings, dict):
+                            self._state["settings"] = settings
 
-                elif kind == "scan_result":
-                    self._state["incidents"] = msg.get("incidents", [])
-                    self._state["actions"] = msg.get("actions", [])
-                    settings = msg.get("settings")
-                    if isinstance(settings, dict):
-                        self._state["settings"] = settings
+                    elif kind == "scan_result":
+                        self._state["incidents"] = msg.get("incidents", [])
+                        self._state["actions"] = msg.get("actions", [])
+                        settings = msg.get("settings")
+                        if isinstance(settings, dict):
+                            self._state["settings"] = settings
 
-                elif kind == "sla_action":
-                    action = msg.get("action") or ""
-                    sev = msg.get("severity") or ""
-                    key = msg.get("incident_key") or "-"
-                    self._state["status"] = f"Notifica Windows {action}: {sev.upper()} {key}"
+                    elif kind == "sla_action":
+                        action = msg.get("action") or ""
+                        sev = msg.get("severity") or ""
+                        key = msg.get("incident_key") or "-"
+                        self._state["status"] = f"Notifica Windows {action}: {sev.upper()} {key}"
 
-                elif kind == "error":
-                    self._state["status"] = msg.get("message") or "Errore"
-                    self._state["actions"] = msg.get("actions") or self._state.get("actions", [])
+                    elif kind == "error":
+                        self._state["status"] = msg.get("message") or "Errore"
+                        self._state["actions"] = msg.get("actions") or self._state.get("actions", [])
 
-                self._state["runtime"] = self._snapshot_runtime()
+                    self._state["runtime"] = self._snapshot_runtime()
+                    self._state["worker_alive"] = bool(self.worker and self.worker.is_alive())
+            except Exception as exc:
+                core.log_file("WEBVIEW_DRAIN_MESSAGE_FAIL", str(exc), exc)
 
     def _send(self, action, **kwargs):
         if not self._running:
             return {"ok": False, "error": "UI chiusa"}
+        if not self.worker or not self.worker.is_alive():
+            with self._lock:
+                self._state["status"] = "Worker non attivo: riavvia l'app."
+                self._state["worker_alive"] = False
+            return {"ok": False, "error": "Worker non attivo: riavvia l'app."}
         self.in_q.put({"action": action, **kwargs})
         return {"ok": True}
 
     def get_state(self):
         with self._lock:
+            self._state["worker_alive"] = bool(self.worker and self.worker.is_alive())
             return copy.deepcopy(self._state)
 
     def refresh_pages(self):
