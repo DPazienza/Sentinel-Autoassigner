@@ -18,7 +18,7 @@ LOG_DIR.mkdir(exist_ok=True)
 BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
 CHROME_DEBUG_PORT = 9222
 EDGE_DEBUG_PORT = 9223
-ENABLE_ASSIGNMENT_WORKFLOW = True
+ENABLE_ASSIGNMENT_WORKFLOW = False
 KEEP_WINDOWS_AWAKE = True
 
 APP_LOG_PATH = LOG_DIR / "app.log"
@@ -114,6 +114,65 @@ install_global_exception_logging()
 def now_utc(): return datetime.now(timezone.utc)
 def now_iso(): return now_utc().isoformat(timespec="seconds")
 def normalize_text(v): return re.sub(r"\s+", " ", v or "").strip()
+def normalize_severity(v):
+    s = normalize_text(v).lower()
+    valid = {
+        'critical': 'Critical',
+        'high': 'High',
+        'medium': 'Medium',
+        'low': 'Low',
+        'informational': 'Informational',
+    }
+    return valid.get(s, '')
+def clean_owner_identity(v):
+    text = normalize_text(v)
+    if not text:
+        return ''
+    bad_fragments = [
+        "use 'space' or 'enter'",
+        'enable edit mode',
+        'press enter',
+        'keyboard',
+        'edit mode',
+    ]
+    lower = text.lower()
+    if any(fragment in lower for fragment in bad_fragments):
+        return ''
+    if len(text) > 120:
+        return ''
+    return text
+
+def looks_like_sentinel_page(url='', title=''):
+    text = f"{url or ''} {title or ''}".lower()
+    return (
+        'sentinel' in text
+        or 'microsoft_azure_security_insights' in text
+        or ('security.microsoft.com' in text and 'incident' in text)
+    )
+
+def looks_like_sentinel_incidents_view(url='', title='', body=''):
+    text = normalize_text(f"{url or ''} {title or ''} {body or ''}").lower()
+    if not looks_like_sentinel_page(url, title):
+        return False
+    markers = (
+        'incident number',
+        'open incidents',
+        'active incidents',
+        'new incidents',
+        'incident provider name',
+        'severity',
+        'owner',
+        'status',
+        'no incidents',
+        'there are no incidents',
+        'nessun incident',
+    )
+    return any(marker in text for marker in markers)
+
+def system32_exe(name):
+    root = os.environ.get('SystemRoot') or r'C:\Windows'
+    path = Path(root) / 'System32' / name
+    return str(path) if path.exists() else name
 
 def local_now_iso():
     return datetime.now().isoformat(timespec="seconds")
@@ -376,7 +435,9 @@ def notify_windows(title, message, severity='medium', incident_key=None, inciden
         log_file("WINDOWS_NOTIFY_OK", f"incident_key={incident_key};severity={sev};actionable={actionable}")
         return True, actionable
     log_file("WINDOWS_NOTIFY_FALLBACK", f"incident_key={incident_key};severity={sev}")
-    _notify_windows_plyer(windows_title, message, timeout)
+    if _notify_windows_plyer(windows_title, message, timeout):
+        log_file("WINDOWS_NOTIFY_OK_PLYER", f"incident_key={incident_key};severity={sev}")
+        return True, False
     return False, False
 
 
@@ -400,14 +461,10 @@ def _notify_windows_toast(title, message, sev='medium', timeout=15, incident_key
         except Exception:
             from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
             from winrt.windows.data.xml.dom import XmlDocument
+        # Raw winsdk/winrt activation is not wired to this app. Keep this
+        # passive; actionable confirm/dismiss is only reported when winotify
+        # callback hooks are actually registered.
         actions = ""
-        if is_urgent:
-            actions = (
-                "<actions>"
-                "<action content='Conferma' arguments='action=confirm&severity=" + sev + "' activationType='foreground'/>"
-                "<action content='Ignora' arguments='action=dismiss&severity=" + sev + "' activationType='foreground'/>"
-                "</actions>"
-            )
         toast_xml = (
             "<toast"
             f" scenario='{scenario}' duration='{duration}' launch='sentinel-notify'>"
@@ -424,8 +481,8 @@ def _notify_windows_toast(title, message, sev='medium', timeout=15, incident_key
         notifier = ToastNotificationManager.create_toast_notifier("Sentinel.Notifier")
         notification = ToastNotification(doc)
         notifier.show(notification)
-        log_file("WINDOWS_TOAST_OK", f"incident_key={incident_key};severity={sev};urgent={is_urgent};action_hooks={bool(is_urgent)}")
-        return True, is_urgent
+        log_file("WINDOWS_TOAST_OK", f"incident_key={incident_key};severity={sev};urgent={is_urgent};action_hooks=False")
+        return True, False
     except Exception as e:
         log_file("WINDOWS_TOAST_FAIL", f"severity={sev}; err={str(e)}")
         # Fallback with winotify (py package available on this environment).
@@ -469,9 +526,10 @@ def _notify_windows_plyer(title, message, timeout):
         from plyer import notification
         notification.notify(title=title, message=message, timeout=timeout, app_name="Sentinel Notifier")
         log_file("WINDOWS_PLYER_OK", f"title={title}")
+        return True
     except Exception:
         log_file("WINDOWS_PLYER_FAIL", f"title={title}")
-        pass
+        return False
 
 class Storage:
     def __init__(self, path: Path):
@@ -529,10 +587,24 @@ class Storage:
                 incident_key TEXT PRIMARY KEY, hidden_at TEXT, reason TEXT)''')
 
             cols = {row[1] for row in con.execute("PRAGMA table_info(incidents)").fetchall()}
-            if 'first_alert_notified' not in cols:
-                con.execute("ALTER TABLE incidents ADD COLUMN first_alert_notified INTEGER DEFAULT 0")
-            if 'first_alert_notified_at' not in cols:
-                con.execute("ALTER TABLE incidents ADD COLUMN first_alert_notified_at TEXT")
+            expected_cols = {
+                'created_time': 'TEXT',
+                'last_update_time': 'TEXT',
+                'activated_at': 'TEXT',
+                'activated_by_bot': 'INTEGER DEFAULT 0',
+                'first_seen_active': 'TEXT',
+                'first_alert_notified': 'INTEGER DEFAULT 0',
+                'first_alert_notified_at': 'TEXT',
+                'last_seen': 'TEXT',
+                'sla_warning_sent': 'INTEGER DEFAULT 0',
+                'last_sla_warning_at': 'TEXT',
+                'workspace_hint': 'TEXT',
+                'source_page': 'TEXT',
+            }
+            for col, ddl in expected_cols.items():
+                if col not in cols:
+                    con.execute(f"ALTER TABLE incidents ADD COLUMN {col} {ddl}")
+                    log_file("DB_SCHEMA_MIGRATE", f"table=incidents;column={col};ddl={ddl}")
 
     def hidden_keys(self):
         with self.connect() as con:
@@ -662,6 +734,7 @@ class Storage:
         if self.is_hidden(key):
             log_file("UPSERT_SEEN_SKIPPED_HIDDEN", f"key={key}")
             return
+        severity = normalize_severity(severity)
         ts = now_iso(); first_active = ts if (status or '').lower() == 'active' else None
         log_file("UPSERT_SEEN", f"key={key};status={status};owner={owner};severity={severity};workspace={workspace};source={source}")
         def _op(con):
@@ -669,6 +742,10 @@ class Storage:
                 VALUES(?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(incident_key) DO UPDATE SET
                 title=excluded.title, severity=COALESCE(NULLIF(excluded.severity,''),incidents.severity),
+                    first_alert_notified=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.first_alert_notified END,
+                    first_alert_notified_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.first_alert_notified_at END,
+                    sla_warning_sent=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.sla_warning_sent END,
+                    last_sla_warning_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.last_sla_warning_at END,
                     status=COALESCE(NULLIF(excluded.status,''),incidents.status),
                     owner=COALESCE(NULLIF(excluded.owner,''),incidents.owner),
                     created_time=COALESCE(NULLIF(excluded.created_time,''),incidents.created_time),
@@ -683,12 +760,17 @@ class Storage:
         if self.is_hidden(key):
             log_file("MARK_ACTIVE_SKIPPED_HIDDEN", f"key={key}")
             return
+        severity = normalize_severity(severity)
         ts = now_iso()
         log_file("MARK_ACTIVATED", f"key={key};severity={severity};workspace={workspace};source={source}")
         def _op(con):
             con.execute('''INSERT INTO incidents(incident_key,title,severity,status,owner,created_time,last_update_time,activated_at,activated_by_bot,first_seen_active,workspace_hint,source_page)
                 VALUES(?,?,?,'Active','me',?,?,?,?,1,?,?)
                 ON CONFLICT(incident_key) DO UPDATE SET title=excluded.title, severity=COALESCE(NULLIF(excluded.severity,''),incidents.severity),
+                first_alert_notified=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.first_alert_notified END,
+                first_alert_notified_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.first_alert_notified_at END,
+                sla_warning_sent=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.sla_warning_sent END,
+                last_sla_warning_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.last_sla_warning_at END,
                 status='Active', owner='me', created_time=COALESCE(NULLIF(excluded.created_time,''),incidents.created_time),
                 last_update_time=COALESCE(NULLIF(excluded.last_update_time,''),incidents.last_update_time),
                 activated_at=COALESCE(incidents.activated_at,excluded.activated_at), activated_by_bot=1,
@@ -721,9 +803,6 @@ class Storage:
                     sync_status["status"] = "CLEARED_EMPTY_VIEW"
                     sync_status["details"] = f"No visible incidents in current Sentinel view; removed={len(stale)}"
                     con.execute("DELETE FROM incidents")
-                    con.execute("DELETE FROM actions")
-                    con.execute("DELETE FROM ignored_incidents")
-                    con.execute("DELETE FROM hidden_incidents")
                 else:
                     sync_status["status"] = "SKIP_EMPTY_UNSAFE"
                     sync_status["details"] = "Visible incident list empty and clear_when_empty=False"
@@ -732,11 +811,6 @@ class Storage:
             placeholders = ",".join(["?"] * len(keys))
             stale = [str(r[0]) for r in con.execute(f"SELECT incident_key FROM incidents WHERE incident_key NOT IN ({placeholders})", keys).fetchall()]
             con.execute(f"DELETE FROM incidents WHERE incident_key NOT IN ({placeholders})", keys)
-            if stale:
-                stale_placeholders = ",".join(["?"] * len(stale))
-                con.execute(f"DELETE FROM actions WHERE incident_key IN ({stale_placeholders})", stale)
-                con.execute(f"DELETE FROM ignored_incidents WHERE incident_key IN ({stale_placeholders})", stale)
-                con.execute(f"DELETE FROM hidden_incidents WHERE incident_key IN ({stale_placeholders})", stale)
 
             # Ignored incidents must never reappear in the dashboard.
             try:
@@ -909,7 +983,7 @@ def runtime_settings_from_storage(store):
         if key in saved:
             log_file("RUNTIME_SETTING_APPLIED", f"{key}={getattr(s, key)};source={saved.get(key)}")
 
-    s.my_owner_identity = saved.get('my_owner_identity', '') or ''
+    s.my_owner_identity = clean_owner_identity(saved.get('my_owner_identity', '') or '')
     log_file("RUNTIME_SETTINGS_DONE", f"my_owner={s.my_owner_identity};scan={s.scan_interval_seconds};auto_fetch={s.auto_fetch_interval_seconds}")
     return s
 
@@ -958,33 +1032,40 @@ class SentinelPageMonitor:
     def parse_row_identity(self, txt):
         text = normalize_text(txt)
         severity = ''
+        sev_re = r"(Critical|High|Medium|Low|Informational)"
 
         # Prefer the actual row shape: severity immediately before the incident ID.
         # Page-level KPI text can contain "High (0) Medium (1)" before the row body,
         # so taking the first severity word from the whole string is unsafe.
         m = re.search(
-            r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\b\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{1,2}/\d{1,2}/\d{2,4})",
+            rf"\b{sev_re}\b\s+(\d{{3,}})\b\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{{1,2}}/\d{{1,2}}/\d{{2,4}})",
             text,
             re.I
         )
         if m:
             return m.group(2), normalize_text(m.group(3)), m.group(1).title()
 
-        m = re.search(r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\b", text, re.I)
+        m = re.search(rf"\b{sev_re}\b\s+(\d{{3,}})\b", text, re.I)
         if m:
             key = m.group(2)
             idx = text.find(key)
             return key, (text[idx + len(key):].strip()[:160] or key), m.group(1).title()
 
-        for sev in ['Critical', 'High', 'Medium', 'Low', 'Informational']:
-            if re.search(rf"\b{sev}\b", text, re.I):
-                severity = sev
-                break
+        # Some grids expose cells in the opposite order: ID first, then severity.
+        m = re.search(rf"\b(\d{{3,}})\b\s+\b{sev_re}\b\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{{1,2}}/\d{{1,2}}/\d{{2,4}})", text, re.I)
+        if m:
+            return m.group(1), normalize_text(m.group(3)), m.group(2).title()
+
+        m = re.search(rf"\b(\d{{3,}})\b\s+\b{sev_re}\b", text, re.I)
+        if m:
+            key = m.group(1)
+            idx = text.find(key)
+            return key, (text[idx + len(key):].strip()[:160] or key), m.group(2).title()
 
         # Typical Sentinel row:
         # Informational 18831 Multi-stage incident ...
         m = re.search(
-            r"\b(Critical|High|Medium|Low|Informational)\b\s+(\d{3,})\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{1,2}/\d{1,2}/\d{2,4})",
+            rf"\b{sev_re}\b\s+(\d{{3,}})\s+(.+?)(?:\s+\d+\s+Microsoft|\s+Microsoft|\s+\d{{1,2}}/\d{{1,2}}/\d{{2,4}})",
             text,
             re.I
         )
@@ -1065,6 +1146,19 @@ class SentinelPageMonitor:
         """
         text = normalize_text(self.body()).lower()
         if not text:
+            return False
+
+        grid_context = (
+            'incident number',
+            'open incidents',
+            'active incidents',
+            'new incidents',
+            'incident provider name',
+            'severity',
+            'owner',
+            'status',
+        )
+        if not any(marker in text for marker in grid_context):
             return False
 
         empty_markers = [
@@ -1773,11 +1867,15 @@ class SentinelPageMonitor:
                 )
             # Learn current user's owner display name after a verified Assign to me.
             if owner and not self.owner_is_unassigned(owner):
-                self.settings.my_owner_identity = owner
-                try:
-                    self.store.save_settings({'my_owner_identity': owner})
-                except Exception:
-                    pass
+                owner_identity = clean_owner_identity(owner)
+                if owner_identity:
+                    self.settings.my_owner_identity = owner_identity
+                    try:
+                        self.store.save_settings({'my_owner_identity': owner_identity})
+                    except Exception:
+                        pass
+                else:
+                    log_file("OWNER_IDENTITY_SKIP", f"key={key};owner={owner}")
             self.store.log_action(key, title, 'WORKFLOW_STEP', 'SUCCESS_VERIFIED', f'owner_before={owner_before}, owner_after={owner}')
             log_file("PROCESS_INCIDENT_ASSIGN", f"key={key};owner_before={owner_before};owner_after={owner}")
 
@@ -1891,6 +1989,8 @@ class SentinelPageMonitor:
 
         # Non ricaricare la pagina: usa la vista corrente, senza cambiare filtri o refreshare la blade.
         self.wait(120)
+        if not self.current_view_looks_like_incidents_grid():
+            raise RuntimeError('La tab selezionata non mostra una vista Sentinel Incidents valida.')
 
         start_scan = time.perf_counter()
         snapshot = self.visible_incident_snapshot(
@@ -1919,10 +2019,15 @@ class SentinelPageMonitor:
             if s:
                 log_file("SCAN_ITEM", f"fetch_only={fetch_only};seen={target.get('incident_key')};processed={p}")
 
-        # Remove stale incidents from dashboard that are no longer present in the current Sentinel view.
-        keys = [x.get('incident_key') for x in snapshot]
-        clear_empty_view = bool(keys) or self.current_view_reports_no_incidents()
-        self.store.sync_visible_incidents(keys, clear_when_empty=clear_empty_view)
+        # Remove stale incidents only after a full view scan. Fast fetch reads a small,
+        # timeout-constrained slice and must not delete incidents that may simply be
+        # outside the current sample, filter, or not yet parsed.
+        if not fetch_only:
+            keys = [x.get('incident_key') for x in snapshot]
+            clear_empty_view = bool(keys) or self.current_view_reports_no_incidents()
+            self.store.sync_visible_incidents(keys, clear_when_empty=clear_empty_view)
+        else:
+            log_file("SYNC_VISIBLE_SKIP", f"fetch_only={fetch_only};snapshot={len(snapshot)}")
 
         total_ms = int((time.perf_counter() - start_scan) * 1000)
         try:
@@ -1932,10 +2037,27 @@ class SentinelPageMonitor:
 
         return scanned, processed
 
+    def current_view_looks_like_incidents_grid(self):
+        try:
+            url = self.page.url or ''
+        except Exception:
+            url = ''
+        try:
+            title = self.page.title() or ''
+        except Exception:
+            title = ''
+        try:
+            body = self.body()
+        except Exception:
+            body = ''
+        ok = looks_like_sentinel_incidents_view(url, title, body)
+        log_file("INCIDENTS_VIEW_CHECK", f"ok={ok};url={url[:160]};title={title[:120]}")
+        return ok
+
 
 class NotifierWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.last_operation_ok=True; self.session_first_notified_keys=set()
+        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.target_page_meta={}; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.last_operation_ok=True; self.session_first_notified_keys=set()
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
     def set_runtime_state(self, **changes):
         with self.state_lock:
@@ -1980,8 +2102,24 @@ class NotifierWorker(threading.Thread):
                 if not _debug_port_alive(port):
                     log_file("BROWSER_CONNECT_SKIP", f"name={name};port={port};reason=debug_port_not_alive")
                     continue
+                owner_pids = [
+                    pid for pid in _debug_port_owner_pids(port)
+                    if _is_owned_debug_browser_process(pid, name, port)
+                ]
+                if not owner_pids:
+                    log_file("BROWSER_CONNECT_SKIP", f"name={name};port={port};reason=debug_port_not_owned")
+                    continue
                 log_file("BROWSER_CONNECT_TRY", f"name={name};port={port}")
-                br=self.playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=10000)
+                try:
+                    br=self.playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=10000)
+                except Exception as first_exc:
+                    log_file("BROWSER_CONNECT_RETRY_RESET", f"name={name};port={port};err={type(first_exc).__name__}: {first_exc}")
+                    if connected:
+                        raise
+                    self.cleanup_playwright()
+                    self.playwright = sync_playwright().start()
+                    log_file("BROWSER_CONNECT_PLAYWRIGHT", "restarted")
+                    br=self.playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{port}', timeout=10000)
                 self.browsers.append((name,br))
                 connected.append(name)
                 log_file("BROWSER_CONNECT_OK", f"{name}:port={port}")
@@ -2033,8 +2171,8 @@ class NotifierWorker(threading.Thread):
                         url=''
                     try: title=page.title()
                     except Exception: title=''
-                    pid=f'{bname}:{cidx}:{pidx}:{abs(hash(url+title))}'; self.pages[pid]=page
-                    is_sentinel=('portal.azure.com' in url or 'security.microsoft.com' in url or 'sentinel' in title.lower())
+                    pid=f'{bname}:{cidx}:{pidx}:{id(page)}'; self.pages[pid]=page
+                    is_sentinel=looks_like_sentinel_page(url, title)
                     rows.append({'page_id':pid,'browser':bname,'title':title[:160],'url':url,'is_sentinel':is_sentinel})
         sentinel_rows = sum(1 for r in rows if r.get('is_sentinel'))
         log_file("REFRESH_PAGES_DONE", f"rows={len(rows)};sentinel_rows={sentinel_rows};connected={connected}")
@@ -2054,13 +2192,15 @@ class NotifierWorker(threading.Thread):
             title = page.title() or ''
         except Exception:
             title = ''
-        text = f"{url} {title}".lower()
-        return 'portal.azure.com' in text or 'security.microsoft.com' in text or 'sentinel' in text
+        return looks_like_sentinel_page(url, title)
 
     def recover_selected_page(self, reason):
         old_target = self.target_page_id or ''
         preferred_browser = old_target.split(':', 1)[0] if ':' in old_target else ''
-        log_file("SELECTED_PAGE_RECOVER_START", f"old_target={old_target};preferred_browser={preferred_browser};reason={reason}")
+        old_meta = getattr(self, 'target_page_meta', {}) or {}
+        old_url = (old_meta.get('url') or '').strip()
+        old_title = (old_meta.get('title') or '').strip()
+        log_file("SELECTED_PAGE_RECOVER_START", f"old_target={old_target};preferred_browser={preferred_browser};old_url={old_url[:120]};reason={reason}")
         if reason in ('closed', 'closed_check_error', 'missing', 'scan_browser_error'):
             try:
                 self.cleanup_playwright()
@@ -2076,16 +2216,33 @@ class NotifierWorker(threading.Thread):
         for pid, page in list(self.pages.items()):
             if self.page_looks_like_sentinel(page):
                 browser_name = pid.split(':', 1)[0] if ':' in pid else ''
-                priority = 0 if preferred_browser and browser_name == preferred_browser else 1
-                candidates.append((priority, pid, page))
+                priority = 20
+                if preferred_browser and browser_name == preferred_browser:
+                    priority -= 8
+                try:
+                    page_url = (page.url or '').strip()
+                except Exception:
+                    page_url = ''
+                try:
+                    page_title = (page.title() or '').strip()
+                except Exception:
+                    page_title = ''
+                if old_url and page_url == old_url:
+                    priority -= 10
+                elif old_url and page_url and old_url.split('#', 1)[0] == page_url.split('#', 1)[0]:
+                    priority -= 6
+                if old_title and page_title == old_title:
+                    priority -= 4
+                candidates.append((priority, pid, page, page_url, page_title, browser_name))
 
         if not candidates:
             log_file("SELECTED_PAGE_RECOVER_FAIL", f"old_target={old_target};reason={reason};pages={len(self.pages)}")
             return None
 
         candidates.sort(key=lambda item: (item[0], item[1]))
-        _, pid, page = candidates[0]
+        _, pid, page, page_url, page_title, browser_name = candidates[0]
         self.target_page_id = pid
+        self.target_page_meta = {'browser': browser_name, 'url': page_url, 'title': page_title}
         self.store.log_system('SELECT_PAGE', 'AUTO_RECOVER', f'old={old_target};new={pid};reason={reason}')
         self.emit('status', {'message':'Tab Sentinel recuperata automaticamente. Monitor ancora attivo.', 'settings': self.settings_dict()})
         log_file("SELECTED_PAGE_RECOVER_OK", f"old_target={old_target};new_target={pid};reason={reason}")
@@ -2176,16 +2333,18 @@ class NotifierWorker(threading.Thread):
                 continue
             created = inc.get('created_time') or ''
             age = created_age_minutes_with_fallback(created, inc.get('last_seen') or inc.get('first_seen_active') or inc.get('activated_at') or '')
-            sev = inc.get('severity') or 'Medium'
-            notify_due = self.settings.notification_for(sev)
-            warn_threshold = self.settings.warning_at(sev)
+            sev = normalize_severity(inc.get('severity') or '')
+            severity_known = bool(sev)
+            sev_label = sev or 'Unknown'
+            notify_due = self.settings.notification_for(sev) if severity_known else 0
+            warn_threshold = self.settings.warning_at(sev) if severity_known else 0
             key = inc.get('incident_key') or '-'
             title = inc.get('title') or '-'
             first_alert_notified = int(inc.get('first_alert_notified') or 0)
-            should_notify_first = (not first_alert_notified) or force_first_alert_for_existing
+            should_notify_first = not first_alert_notified
             if should_notify_first and key not in self.session_first_notified_keys:
                 nt = 'Nuovo alert rilevato'
-                message = f'Nuovo alert rilevato: {key} ({sev}). {title}'
+                message = f'Nuovo alert rilevato: {key} ({sev_label}). {title}'
                 sev_norm = (sev or '').strip().lower()
                 notification_ok, actionable = notify_windows(nt, message, severity=sev_norm, incident_key=key, incident_title=title)
                 age_label = str(age) if age is not None else 'N/D'
@@ -2204,13 +2363,16 @@ class NotifierWorker(threading.Thread):
                         self.store.mark_first_alert_notified(key)
                     self.store.mark_last_seen(key)
                     self.session_first_notified_keys.add(key)
-                    self.store.log_action(key, title, 'NEW_ALERT_NOTIFICATION', 'SENT', f'age={age_label}, created={created}, severity={sev}')
-                    log_file("SLA_FIRST_NOTIFY", f"key={key};severity={sev};age={age_label};first={first_alert_notified}")
-                    log_file("SLA_NOTIFY_FLOW", f"key={key};type=first;severity={sev};ok=1")
+                    self.store.log_action(key, title, 'NEW_ALERT_NOTIFICATION', 'SENT', f'age={age_label}, created={created}, severity={sev_label}')
+                    log_file("SLA_FIRST_NOTIFY", f"key={key};severity={sev_label};age={age_label};first={first_alert_notified}")
+                    log_file("SLA_NOTIFY_FLOW", f"key={key};type=first;severity={sev_label};ok=1")
                     warnings += 1
                     continue
-                self.store.log_action(key, title, 'NEW_ALERT_NOTIFICATION', 'FAILED', f'age={age_label}, created={created}, severity={sev}')
-                log_file("SLA_NOTIFY_FLOW", f"key={key};type=first;severity={sev};ok=0")
+                self.store.log_action(key, title, 'NEW_ALERT_NOTIFICATION', 'FAILED', f'age={age_label}, created={created}, severity={sev_label}')
+                log_file("SLA_NOTIFY_FLOW", f"key={key};type=first;severity={sev_label};ok=0")
+                continue
+            if not severity_known:
+                log_file("SLA_SKIP", f"key={key};reason=severity_unknown")
                 continue
             if age is None:
                 log_file("SLA_SKIP", f"key={key};reason=age_unknown")
@@ -2234,27 +2396,27 @@ class NotifierWorker(threading.Thread):
                 self.emit('sla_confirm', {
                     'incident_key': key,
                     'incident_title': title,
-                'severity': sev_norm,
-                'age': age,
-                'threshold': warn_threshold,
-                'message': message,
-                'notification_ok': notification_ok,
+                    'severity': sev_norm,
+                    'age': age,
+                    'threshold': warn_threshold,
+                    'message': message,
+                    'notification_ok': notification_ok,
                 })
-                if notification_ok:
-                    self.store.mark_last_seen(key)
-                    self.store.mark_sla_warning(key)
-                    self.store.log_action(key, title, 'SLA_NOTIFICATION', 'SENT', f'age={age}, notification_due={notify_due}, warning_percent={warn_pct}, warning_threshold={warn_threshold}, repeat_minutes={self.settings.notification_repeat_minutes}, severity={sev}, created={created}')
-                    log_file("SLA_NOTIFY", f"key={key};severity={sev};age={age};result=SENT")
-                    log_file("SLA_NOTIFY_FLOW", f"key={key};type=notify;severity={sev};ok=1")
-                    warnings += 1
-                else:
-                    self.store.log_action(key, title, 'SLA_NOTIFICATION', 'FAILED', f'age={age}, notification_due={notify_due}, warning_percent={warn_pct}, warning_threshold={warn_threshold}, repeat_minutes={self.settings.notification_repeat_minutes}, severity={sev}, created={created}')
-                    log_file("SLA_NOTIFY", f"key={key};severity={sev};age={age};result=FAILED")
-                    log_file("SLA_NOTIFY_FLOW", f"key={key};type=notify;severity={sev};ok=0")
+            if notification_ok:
+                self.store.mark_last_seen(key)
+                self.store.mark_sla_warning(key)
+                self.store.log_action(key, title, 'SLA_NOTIFICATION', 'SENT', f'age={age}, notification_due={notify_due}, warning_percent={warn_pct}, warning_threshold={warn_threshold}, repeat_minutes={self.settings.notification_repeat_minutes}, severity={sev}, created={created}')
+                log_file("SLA_NOTIFY", f"key={key};severity={sev};age={age};result=SENT")
+                log_file("SLA_NOTIFY_FLOW", f"key={key};type=notify;severity={sev};ok=1")
+                warnings += 1
+            else:
+                self.store.log_action(key, title, 'SLA_NOTIFICATION', 'FAILED', f'age={age}, notification_due={notify_due}, warning_percent={warn_pct}, warning_threshold={warn_threshold}, repeat_minutes={self.settings.notification_repeat_minutes}, severity={sev}, created={created}')
+                log_file("SLA_NOTIFY", f"key={key};severity={sev};age={age};result=FAILED")
+                log_file("SLA_NOTIFY_FLOW", f"key={key};type=notify;severity={sev};ok=0")
         elapsed = int((time.perf_counter() - check_started) * 1000)
         log_file("SLA_CHECK_DONE", f"warnings={warnings};elapsed_ms={elapsed};total={total}")
         return warnings
-    def run_scan(self, fetch_only=False, force_first_alert_for_existing=False):
+    def run_scan(self, fetch_only=False, force_first_alert_for_existing=False, _retry_after_recover=False):
         """
         Runs exactly one browser operation at a time.
         This prevents auto-fetch and monitor actions from touching the same Sentinel tab together.
@@ -2319,6 +2481,21 @@ class NotifierWorker(threading.Thread):
                     f"kind={'fetch' if fetch_only else 'scan'}; scanned={scanned}; processed={processed}; scan_ms={scan_ms}"
                 )
 
+                post_state = self.get_runtime_state()
+                interrupted = (
+                    post_state.get('shutdown_requested')
+                    or post_state.get('stop_requested')
+                    or ((not fetch_only) and (post_state.get('paused') or not post_state.get('running_monitor')))
+                )
+                if interrupted:
+                    self.store.log_system('FETCH' if fetch_only else 'SCAN', 'INTERRUPTED', f'scanned={scanned}, processed={processed}')
+                    self.emit('status', {
+                        'message': f"{'Fetch' if fetch_only else 'Scan'} interrotto: {scanned} eventi letti, {processed} processati",
+                        'settings': self.settings_dict()
+                    })
+                    log_file("RUN_SCAN_INTERRUPTED", f"run_id={run_id};fetch_only={fetch_only};state={post_state};scanned={scanned};processed={processed}")
+                    return scanned, processed
+
                 sla_start = time.perf_counter()
                 warnings = self.check_sla(force_first_alert_for_existing=force_first_alert_for_existing)
                 sla_ms = int((time.perf_counter() - sla_start) * 1000)
@@ -2356,6 +2533,11 @@ class NotifierWorker(threading.Thread):
                 if any(token in err_text for token in ('target page', 'page closed', 'browser has been closed', 'context has been closed', 'target closed', 'cdp', 'connection closed')):
                     recovered = self.recover_selected_page('scan_browser_error')
                     log_file("RUN_SCAN_RECOVER_AFTER_ERROR", f"run_id={run_id};recovered={bool(recovered)};target={self.target_page_id}")
+                    if recovered and not _retry_after_recover and not self.get_runtime_state().get('shutdown_requested') and not self.get_runtime_state().get('stop_requested'):
+                        self.store.log_system('FETCH' if fetch_only else 'SCAN', 'RETRY_AFTER_RECOVERY', f'fetch_only={fetch_only}')
+                        self.emit('status', {'message':'Tab Sentinel recuperata, ritento operazione una sola volta...', 'settings': self.settings_dict()})
+                        self.set_runtime_state(operation_in_progress=False, operation_kind='')
+                        return self.run_scan(fetch_only=fetch_only, force_first_alert_for_existing=force_first_alert_for_existing, _retry_after_recover=True)
                 self.emit('error', {'message': details, 'actions': self.store.actions()})
                 self.emit('status', {'message': f"{'Fetch' if fetch_only else 'Scan'} fallito: {type(e).__name__}", 'settings': self.settings_dict()})
                 log_file("RUN_SCAN_ERROR", f"{type(e).__name__}")
@@ -2401,6 +2583,20 @@ class NotifierWorker(threading.Thread):
 
             elif a == 'select_page':
                 self.target_page_id = cmd.get('page_id')
+                page = self.pages.get(self.target_page_id)
+                meta = {}
+                if page is not None:
+                    try:
+                        meta['url'] = page.url or ''
+                    except Exception:
+                        meta['url'] = ''
+                    try:
+                        meta['title'] = page.title() or ''
+                    except Exception:
+                        meta['title'] = ''
+                    meta['browser'] = self.target_page_id.split(':', 1)[0] if ':' in str(self.target_page_id or '') else ''
+                self.target_page_meta = meta
+                self.set_runtime_state(auto_fetch_enabled=True, stop_requested=False)
                 self.store.log_system('SELECT_PAGE', 'SUCCESS', str(self.target_page_id))
                 self.emit('status', {'message':f'Selected page: {self.target_page_id}', 'settings':self.settings_dict()})
                 log_file("HANDLE_SELECT_PAGE", f"target={self.target_page_id}")
@@ -2538,10 +2734,10 @@ class NotifierWorker(threading.Thread):
                     and self.target_page_id
                     and time.time() - self.last_fetch_ts >= self.settings.auto_fetch_interval_seconds
                 ):
-                    self.last_fetch_ts = time.time()
                     self.emit('status', {'message':'Auto-fetch current Sentinel view...', 'settings':self.settings_dict()})
                     log_file("RUN_LOOP_TRIGGER", f"auto_fetch_interval={self.settings.auto_fetch_interval_seconds};target={self.target_page_id}")
                     self.run_scan(fetch_only=True, force_first_alert_for_existing=False)
+                    self.last_fetch_ts = time.time()
 
                 state = self.get_runtime_state()
                 if (
@@ -2552,10 +2748,10 @@ class NotifierWorker(threading.Thread):
                     and self.target_page_id
                     and time.time() - state.get('last_scan_ts', 0) >= self.settings.scan_interval_seconds
                 ):
-                    self.set_runtime_state(last_scan_ts=time.time())
                     self.emit('status', {'message':'Automatic monitor scan running...', 'settings':self.settings_dict()})
                     log_file("RUN_LOOP_TRIGGER", f"auto_scan_interval={self.settings.scan_interval_seconds};target={self.target_page_id}")
                     self.run_scan(fetch_only=False)
+                    self.set_runtime_state(last_scan_ts=time.time())
 
             except Exception as e:
                 details = f'worker loop error={type(e).__name__}: {e}'
@@ -2574,12 +2770,12 @@ class NotifierWorker(threading.Thread):
         self.store.log_system('WORKER', 'EXIT', '')
 
 def find_chrome_path():
-    for c in [os.path.join(os.environ.get('ProgramFiles',''),'Google','Chrome','Application','chrome.exe'), os.path.join(os.environ.get('ProgramFiles(x86)',''),'Google','Chrome','Application','chrome.exe'), shutil.which('chrome.exe')]:
+    for c in [os.path.join(os.environ.get('ProgramFiles',''),'Google','Chrome','Application','chrome.exe'), os.path.join(os.environ.get('ProgramFiles(x86)',''),'Google','Chrome','Application','chrome.exe')]:
         if c and Path(c).exists(): return c
     return None
 
 def find_edge_path():
-    for c in [os.path.join(os.environ.get('ProgramFiles',''),'Microsoft','Edge','Application','msedge.exe'), os.path.join(os.environ.get('ProgramFiles(x86)',''),'Microsoft','Edge','Application','msedge.exe'), shutil.which('msedge.exe')]:
+    for c in [os.path.join(os.environ.get('ProgramFiles',''),'Microsoft','Edge','Application','msedge.exe'), os.path.join(os.environ.get('ProgramFiles(x86)',''),'Microsoft','Edge','Application','msedge.exe')]:
         if c and Path(c).exists(): return c
     return None
 
@@ -2595,7 +2791,7 @@ def _debug_port_alive(port):
 def _debug_port_owner_pids(port):
     pids = set()
     try:
-        out = subprocess.check_output(['netstat', '-ano'], text=True, stderr=subprocess.DEVNULL)
+        out = subprocess.check_output([system32_exe('netstat.exe'), '-ano'], text=True, stderr=subprocess.DEVNULL)
         needle = f":{int(port)}"
         for line in out.splitlines():
             parts = line.split()
@@ -2613,11 +2809,55 @@ def _debug_port_owner_pids(port):
         log_file("DEBUG_PORT_OWNER_FAIL", f"port={port};err={type(exc).__name__}: {exc}")
     return sorted(pids)
 
+def _process_command_line(pid):
+    if os.name != 'nt':
+        return ''
+    try:
+        ps = (
+            "$p=Get-CimInstance Win32_Process -Filter \"ProcessId="
+            + str(int(pid))
+            + "\"; if ($p) { $p.CommandLine }"
+        )
+        result = subprocess.run(
+            [system32_exe('WindowsPowerShell\\v1.0\\powershell.exe'), '-NoProfile', '-Command', ps],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+        return (result.stdout or '').strip()
+    except Exception as exc:
+        log_file("PROCESS_COMMAND_LINE_FAIL", f"pid={pid};err={type(exc).__name__}: {exc}")
+        return ''
+
+def _is_owned_debug_browser_process(pid, browser, port):
+    cmd = _process_command_line(pid)
+    if not cmd:
+        return False
+    lower = cmd.lower()
+    expected_name = 'chrome.exe' if (browser or '').lower() == 'chrome' else 'msedge.exe'
+    if expected_name not in lower:
+        return False
+    if f"remote-debugging-port={int(port)}" not in lower:
+        return False
+    profile_markers = (
+        'chrome_notifier_profile',
+        'chrome_bot_profile',
+        'chrome_monitor_profile',
+        'edge_notifier_profile',
+        'edge_bot_profile',
+        'edge_monitor_profile',
+    )
+    return any(marker in lower for marker in profile_markers)
+
 def terminate_debug_port_owner(browser, port, reason='stale_debug_port'):
     killed = []
     for pid in _debug_port_owner_pids(port):
+        if not _is_owned_debug_browser_process(pid, browser, port):
+            log_file("DEBUG_PORT_KILL_SKIP", f"browser={browser};port={port};pid={pid};reason=not_owned")
+            continue
         try:
-            result = subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            result = subprocess.run([system32_exe('taskkill.exe'), '/PID', str(pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             if result.returncode == 0:
                 killed.append(pid)
         except Exception as exc:
@@ -2650,6 +2890,14 @@ def launch_browser_debug(browser):
         return False
 
     if _debug_port_alive(port):
+        owner_pids = [
+            pid for pid in _debug_port_owner_pids(port)
+            if _is_owned_debug_browser_process(pid, browser, port)
+        ]
+        if not owner_pids:
+            log_file("LAUNCH_BROWSER_BLOCKED", f"browser={browser};port={port};reason=debug_port_not_owned")
+            messagebox.showwarning('Porta debug non sicura', f'La porta debug {port} e gia attiva ma non sembra appartenere al profilo controllato dell app.')
+            return False
         log_file("LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_listening")
         return True
 
@@ -3090,7 +3338,11 @@ class NotifierApp(tk.Tk):
 
     def stop_monitor(self):
         log_file("UI_STOP", "")
-        self.worker.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False)
+        self.worker.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, stop_requested=True)
+        try:
+            self.worker.session_first_notified_keys.clear()
+        except Exception:
+            pass
         self.status_var.set('Monitor stopped. Auto-fetch disabled.')
         self.send('stop')
 
@@ -3328,7 +3580,9 @@ class NotifierApp(tk.Tk):
                         self.status_var.set(f"Notifica Windows {action} - {sev.upper()} {msg.get('incident_key','-')}")
                 elif kind=='error':
                     log_file("UI_POLL", f"kind=error;message={msg.get('message','')[:120]}")
-                    self.status_var.set('ERROR: '+msg.get('message','')); self.refresh_actions(msg.get('actions',[])); messagebox.showwarning('monitor error', msg.get('message','Unknown error'))
+                    self.status_var.set('ERROR: '+msg.get('message',''))
+                    self.refresh_actions(msg.get('actions',[]))
+                    log_file("UI_ERROR_NON_MODAL", msg.get('message','Unknown error'))
         except queue.Empty: pass
         self.after(700,self.poll_worker)
 

@@ -36,6 +36,13 @@ def _launch_browser_process(browser):
 
     port = core.CHROME_DEBUG_PORT if browser == "chrome" else core.EDGE_DEBUG_PORT
     if core._debug_port_alive(port):
+        owner_pids = [
+            pid for pid in core._debug_port_owner_pids(port)
+            if core._is_owned_debug_browser_process(pid, browser, port)
+        ]
+        if not owner_pids:
+            core.log_file("WEBVIEW_LAUNCH_BROWSER_BLOCKED", f"browser={browser};port={port};reason=debug_port_not_owned")
+            return False, f"Porta debug {port} gia attiva ma non appartiene al profilo controllato dell'app"
         core.log_file("WEBVIEW_LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_ready")
         return True, ""
 
@@ -84,6 +91,7 @@ class WebViewApi:
         self.out_q = out_q
         self._lock = threading.RLock()
         self._running = True
+        self._launching_browsers = set()
         self._state = {
             "status": "Worker pronto. Seleziona o avvia una tab Sentinel.",
             "runtime": self._snapshot_runtime(),
@@ -93,6 +101,7 @@ class WebViewApi:
             "pages": [],
             "connected": [],
             "selected_page_id": None,
+            "worker_alive": True,
         }
         self._drain_thread = threading.Thread(target=self._drain_messages, daemon=True)
         self._drain_thread.start()
@@ -173,7 +182,8 @@ class WebViewApi:
                 core.log_file("WEBVIEW_DRAIN_MESSAGE_FAIL", str(exc), exc)
 
     def _send(self, action, **kwargs):
-        if not self._running:
+        self._apply_immediate_control(action)
+        if not self._running and action != "shutdown":
             return {"ok": False, "error": "UI chiusa"}
         if not self.worker or not self.worker.is_alive():
             with self._lock:
@@ -183,25 +193,73 @@ class WebViewApi:
         self.in_q.put({"action": action, **kwargs})
         return {"ok": True}
 
+    def _apply_immediate_control(self, action):
+        try:
+            if not self.worker:
+                return
+            if action == "pause":
+                self.worker.set_runtime_state(paused=True, auto_fetch_enabled=False)
+                with self._lock:
+                    self._state["status"] = "Pausa richiesta. Stop scan in corso appena possibile."
+            elif action == "stop":
+                self.worker.set_runtime_state(
+                    running_monitor=False,
+                    paused=False,
+                    starting=False,
+                    auto_fetch_enabled=False,
+                    stop_requested=True,
+                )
+                try:
+                    self.worker.session_first_notified_keys.clear()
+                except Exception:
+                    pass
+                with self._lock:
+                    self._state["status"] = "Stop richiesto. Operazioni in corso in chiusura."
+            elif action == "shutdown":
+                self.worker.set_runtime_state(
+                    running_monitor=False,
+                    paused=False,
+                    starting=False,
+                    auto_fetch_enabled=False,
+                    shutdown_requested=True,
+                    stop_requested=True,
+                )
+                with self._lock:
+                    self._state["status"] = "Chiusura worker richiesta."
+        except Exception as exc:
+            core.log_file("WEBVIEW_IMMEDIATE_CONTROL_FAIL", f"action={action}", exc)
+
     def get_state(self):
         with self._lock:
             self._state["worker_alive"] = bool(self.worker and self.worker.is_alive())
+            self._state["runtime"] = self._snapshot_runtime()
             return copy.deepcopy(self._state)
 
     def refresh_pages(self):
         return self._send("refresh_pages")
 
     def launch_browser(self, browser):
+        browser_key = (browser or "").strip().lower()
+        if browser_key not in ("chrome", "edge"):
+            return {"ok": False, "error": "Browser non valido"}
         with self._lock:
-            self._state["status"] = f"Avvio {browser} debug in corso..."
-        ok, err = _launch_browser_process(browser)
-        if not ok:
+            if browser_key in self._launching_browsers:
+                return {"ok": True}
+            self._launching_browsers.add(browser_key)
+            self._state["status"] = f"Avvio {browser_key} debug in corso..."
+
+        def _launch_job():
+            ok, err = _launch_browser_process(browser_key)
             with self._lock:
-                self._state["status"] = err
-            return {"ok": False, "error": err}
-        with self._lock:
-            self._state["status"] = f"{browser} debug avviato. Aggiornamento tab..."
-        self.refresh_pages()
+                self._launching_browsers.discard(browser_key)
+                self._state["status"] = (
+                    f"{browser_key} debug avviato. Aggiornamento tab..."
+                    if ok else (err or f"{browser_key} non avviato")
+                )
+            if ok:
+                self.refresh_pages()
+
+        threading.Thread(target=_launch_job, name=f"launch-{browser_key}", daemon=True).start()
         return {"ok": True}
 
     def select_page(self, page_id):
@@ -237,21 +295,54 @@ class WebViewApi:
         return self._send("stop")
 
     def ignore_incident(self, incident_key):
-        return self._send("ignore_incident", incident_key=incident_key)
+        result = self._send("ignore_incident", incident_key=incident_key)
+        if result.get("ok"):
+            key = str(incident_key or "").strip()
+            with self._lock:
+                self._state["incidents"] = [
+                    inc for inc in self._state.get("incidents", [])
+                    if str(inc.get("incident_key") or "").strip() != key
+                ]
+                self._state["status"] = f"Incident {key or '-'} ignorato localmente."
+        return result
 
     def dismiss_incident(self, incident_key):
-        return self._send("dismiss_incident", incident_key=incident_key)
+        result = self._send("dismiss_incident", incident_key=incident_key)
+        if result.get("ok"):
+            key = str(incident_key or "").strip()
+            with self._lock:
+                self._state["incidents"] = [
+                    inc for inc in self._state.get("incidents", [])
+                    if str(inc.get("incident_key") or "").strip() != key
+                ]
+                self._state["status"] = f"Incident {key or '-'} rimosso dal database locale."
+        return result
 
     def unignore_all(self):
         return self._send("unignore_all")
 
     def save_settings(self, values):
         payload = self._normalize_ints(values)
-        return self._send("settings", values=payload)
+        result = self._send("settings", values=payload)
+        if not result.get("ok"):
+            with self._lock:
+                self._state["status"] = result.get("error") or "Impostazioni non salvate: worker non disponibile."
+            return result
+        with self._lock:
+            current = self._state.get("settings", {})
+            if isinstance(current, dict):
+                merged = dict(current)
+                merged.update(payload)
+                self._state["settings"] = merged
+            else:
+                self._state["settings"] = dict(payload)
+            self._state["status"] = "Impostazioni salvate in coda."
+        return result
 
     def shutdown(self):
+        result = self._send("shutdown")
         self._running = False
-        return self._send("shutdown")
+        return result
 
 
 def _build_window_html():
@@ -279,27 +370,47 @@ def run_webview(debug=False):
     api.refresh_pages()
 
     html = _build_window_html()
-    window = webview.create_window(
-        "Sentinel Notifier",
-        html=html,
-        js_api=api,
-        width=1550,
-        height=980,
-        min_size=(1220, 820),
-    )
+    try:
+        window = webview.create_window(
+            "Sentinel Notifier",
+            html=html,
+            js_api=api,
+            width=1360,
+            height=900,
+            min_size=(980, 720),
+        )
 
-    def _on_closed():
+        def _on_closed():
+            try:
+                api.shutdown()
+            except Exception:
+                pass
+
+        try:
+            window.events.closed += _on_closed
+        except Exception:
+            pass
+
+        webview.start(gui="edgechromium", debug=debug)
+    except Exception as exc:
+        core.log_file("WEBVIEW_RUNTIME_FAIL", str(exc), exc)
+        raise
+    finally:
         try:
             api.shutdown()
         except Exception:
             pass
-
-    try:
-        window.events.closed += _on_closed
-    except Exception:
-        pass
-
-    webview.start(gui="edgechromium", debug=debug)
+        try:
+            worker.join(timeout=2)
+        except Exception:
+            pass
+        if worker.is_alive():
+            core.log_file("WEBVIEW_WORKER_JOIN_TIMEOUT", "skip cross-thread playwright cleanup")
+        else:
+            try:
+                worker.cleanup_playwright()
+            except Exception:
+                pass
 
 
 def run_tk():
@@ -319,8 +430,9 @@ def main():
 
     try:
         run_webview(debug=args.debug)
-    except Exception:
-        run_tk()
+    except Exception as exc:
+        core.log_file("WEBVIEW_MAIN_FAIL", str(exc), exc)
+        raise
 
 
 if __name__ == "__main__":

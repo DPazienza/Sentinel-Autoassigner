@@ -21,7 +21,6 @@
       --chip-bg: #f1f5f9;
       --shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
       --radius: 14px;
-      --ui-scale: 1;
     }
 
     * { box-sizing: border-box; }
@@ -39,7 +38,6 @@
       margin: 12px auto;
       display: grid;
       gap: 14px;
-      zoom: var(--ui-scale);
     }
 
     .header {
@@ -115,6 +113,12 @@
       font-weight: 600;
       cursor: pointer;
       font-size: 13px;
+      min-height: 40px;
+    }
+    .btn.compact {
+      min-height: 36px;
+      padding: 7px 10px;
+      font-size: 12px;
     }
     .btn:hover { background: var(--primary-hover); }
     .btn:focus-visible,
@@ -136,6 +140,7 @@
     }
     .btn.danger { background: var(--danger); }
     .btn + .btn { margin-left: 8px; }
+    .stack .btn + .btn { margin-left: 0; }
 
     .chip-row {
       display: flex;
@@ -293,6 +298,14 @@
       min-width: 0;
       font-size: 13px;
     }
+    .incidents-table {
+      min-width: 1180px;
+    }
+    .incidents-table th:first-child,
+    .incidents-table td:first-child {
+      white-space: nowrap;
+      min-width: 136px;
+    }
     th, td {
       text-align: left;
       padding: 10px;
@@ -334,7 +347,7 @@
         <h1>Sentinel Notifier</h1>
         <p class="subtitle">Dashboard operativa: workspace, Stato notifier e SLA in alto; incidenti in basso.</p>
       </div>
-      <div class="status" id="runtimeBadge">Runtime: Attivo</div>
+      <div class="status" id="runtimeBadge" role="status" aria-live="polite" aria-atomic="true">Runtime: Attivo</div>
     </section>
 
     <section class="top-grid">
@@ -349,7 +362,7 @@
           <button class="btn" id="launchChromeBtn">Lancia Chrome Debug</button>
           <button class="btn secondary" id="launchEdgeBtn">Lancia Edge Debug</button>
           <button class="btn secondary" id="refreshTabsBtn">Aggiorna tab</button>
-          <button class="btn ghost" id="openSentinelBtn">Apri Sentinel</button>
+          <button class="btn ghost" id="openSentinelBtn">Usa tab Sentinel</button>
         </div>
         <ul class="workspace-list" id="workspaceList">
           <li>In attesa del collegamento al backend...</li>
@@ -379,7 +392,7 @@
         <div class="chip-row">
           <span class="chip">Scan: <span class="value" id="scanInterval">45s</span></span>
           <span class="chip">Auto-fetch: <span class="value" id="autoFetchInterval">20s</span></span>
-          <span class="chip">Notifiche: <span class="value">On</span></span>
+          <span class="chip">Notifiche: <span class="value" id="notificationsState">On</span></span>
         </div>
         <div class="stack" style="margin-top: 12px;">
           <button class="btn" id="startBtn">Start monitor</button>
@@ -447,70 +460,78 @@
           <div class="settings-grid">
             <div class="row">
               <label for="tc-critical">Critical - Taking Charge (min)</label>
-              <input id="tc-critical" class="input" value="30" />
+              <input id="tc-critical" class="input" type="number" min="1" max="10080" step="1" value="30" />
             </div>
             <div class="row">
               <label for="nt-critical">Critical - Notification Time (min)</label>
-              <input id="nt-critical" class="input" value="30" />
+              <input id="nt-critical" class="input" type="number" min="1" max="10080" step="1" value="30" />
             </div>
             <div class="row">
               <label for="rt-critical">Critical - Resolution Time (min)</label>
-              <input id="rt-critical" class="input" value="60" />
+              <input id="rt-critical" class="input" type="number" min="1" max="10080" step="1" value="60" />
             </div>
             <div class="row">
               <label for="tc-high">High - Taking Charge (min)</label>
-              <input id="tc-high" class="input" value="60" />
+              <input id="tc-high" class="input" type="number" min="1" max="10080" step="1" value="60" />
             </div>
             <div class="row">
               <label for="nt-high">High - Notification Time (min)</label>
-              <input id="nt-high" class="input" value="60" />
+              <input id="nt-high" class="input" type="number" min="1" max="10080" step="1" value="60" />
             </div>
             <div class="row">
               <label for="rt-high">High - Resolution Time (min)</label>
-              <input id="rt-high" class="input" value="120" />
+              <input id="rt-high" class="input" type="number" min="1" max="10080" step="1" value="120" />
             </div>
             <div class="row">
               <label for="tc-medium">Medium - Taking Charge (min)</label>
-              <input id="tc-medium" class="input" value="60" />
+              <input id="tc-medium" class="input" type="number" min="1" max="10080" step="1" value="60" />
             </div>
             <div class="row">
               <label for="nt-medium">Medium - Notification Time (min)</label>
-              <input id="nt-medium" class="input" value="240" />
+              <input id="nt-medium" class="input" type="number" min="1" max="10080" step="1" value="240" />
             </div>
             <div class="row">
               <label for="rt-medium">Medium - Resolution Time (min)</label>
-              <input id="rt-medium" class="input" value="480" />
+              <input id="rt-medium" class="input" type="number" min="1" max="10080" step="1" value="480" />
             </div>
             <div class="row">
               <label for="tc-low">Low - Taking Charge (min)</label>
-              <input id="tc-low" class="input" value="60" />
+              <input id="tc-low" class="input" type="number" min="1" max="10080" step="1" value="60" />
             </div>
             <div class="row">
               <label for="nt-low">Low - Notification Time (min)</label>
-              <input id="nt-low" class="input" value="480" />
+              <input id="nt-low" class="input" type="number" min="1" max="10080" step="1" value="480" />
             </div>
             <div class="row">
               <label for="rt-low">Low - Resolution Time (min)</label>
-              <input id="rt-low" class="input" value="720" />
+              <input id="rt-low" class="input" type="number" min="1" max="10080" step="1" value="720" />
             </div>
             <div class="row">
               <label for="misclassification">Misclassification (max % mensile)</label>
-              <input id="misclassification" class="input" value="1" />
+              <input id="misclassification" class="input" type="number" min="0" max="100" step="1" value="1" />
             </div>
             <div class="row">
               <label for="windows-win-rate">Windows notification success (%)</label>
-              <input id="windows-win-rate" class="input" value="96" />
+              <input id="windows-win-rate" class="input" type="number" min="1" max="100" step="1" value="96" />
             </div>
             <div class="row">
               <label for="windows-repeat-min">Ripeti notifica Windows ogni (min)</label>
-              <input id="windows-repeat-min" class="input" value="30" />
+              <input id="windows-repeat-min" class="input" type="number" min="1" max="10080" step="1" value="30" />
+            </div>
+            <div class="row">
+              <label for="scan-interval-seconds">Scan interval (secondi)</label>
+              <input id="scan-interval-seconds" class="input" type="number" min="60" max="3600" step="1" value="60" />
+            </div>
+            <div class="row">
+              <label for="auto-fetch-interval-seconds">Auto-fetch interval (secondi)</label>
+              <input id="auto-fetch-interval-seconds" class="input" type="number" min="60" max="3600" step="1" value="60" />
             </div>
           </div>
           <div class="actions-grid">
             <button class="btn" id="saveSettingsBtn">Salva tutte le impostazioni</button>
             <button class="btn ghost" id="closeSlaAdvancedBtn">Chiudi</button>
           </div>
-        </div>
+        </section>
       </article>
     </section>
 
@@ -524,7 +545,7 @@
 
         <div id="incidents" class="panel active">
           <div class="table-wrap">
-            <table aria-label="Incident list">
+            <table class="incidents-table" aria-label="Incident list">
               <thead>
               <tr>
                 <th>Azioni</th>
@@ -532,7 +553,7 @@
               </tr>
             </thead>
             <tbody id="incidentsTableBody">
-                <tr><td colspan="11" style="text-align:center; color:#64748b;">In attesa stato...</td></tr>
+                <tr><td colspan="12" style="text-align:center; color:#64748b;">In attesa stato...</td></tr>
               </tbody>
             </table>
           </div>
@@ -557,10 +578,7 @@
   <script>
     function setAdaptiveUiScale() {
       try {
-        const dpr = window.devicePixelRatio || 1;
-        const scaled = Math.max(0.86, Math.min(1, 1.15 / dpr));
-        const root = document.documentElement;
-        root.style.setProperty('--ui-scale', scaled.toFixed(3));
+        document.documentElement.classList.toggle('scaled-display', (window.devicePixelRatio || 1) > 1.1);
       } catch {
         // fallback default
       }
@@ -591,14 +609,33 @@
       'misclassification':'misclassification_percent',
       'windows-win-rate':'notification_warning_percent',
       'windows-repeat-min':'notification_repeat_minutes',
+      'scan-interval-seconds':'scan_interval_seconds',
+      'auto-fetch-interval-seconds':'auto_fetch_interval_seconds',
     };
 
     let isPaused = false;
+    let settingsDirty = false;
+    let lastPagesHash = '';
+    let lastIncidentsHash = '';
+    let lastActionsHash = '';
 
-    function toSafe(value) {
-      if (value === null || value === undefined) return '-';
+    function toSafe(value, fallback = '-') {
+      if (value === null || value === undefined) return fallback;
       const v = String(value).trim();
-      return v || '-';
+      return v || fallback;
+    }
+
+    function escapeHtml(value) {
+      return toSafe(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replaceAll('`', '&#96;');
     }
 
     function severityClass(level) {
@@ -618,10 +655,10 @@
         const rtCell = document.querySelector(`.${entry.rt}`);
         const kpiCell = document.querySelector(`.${entry.kpi}`);
 
-        if (tcCell) tcCell.innerHTML = `<span class="matrix-chip ${entry.color}">${tc}</span>`;
-        if (ntCell) ntCell.innerHTML = `<span class="matrix-chip ${entry.color}">${nt}</span>`;
-        if (rtCell) rtCell.innerHTML = `<span class="matrix-chip ${entry.color}">${rt}</span>`;
-        if (kpiCell) kpiCell.innerHTML = `<span class="matrix-chip normal">≤ ${toSafe(settings.misclassification_percent, '1')}%</span>`;
+        if (tcCell) tcCell.textContent = tc;
+        if (ntCell) ntCell.textContent = nt;
+        if (rtCell) rtCell.textContent = rt;
+        if (kpiCell) kpiCell.textContent = `≤ ${toSafe(settings.misclassification_percent, '1')}%`;
       });
 
       const winRate = document.getElementById('windows-win-rate');
@@ -633,6 +670,10 @@
     }
 
     function fillInputs(settings = {}) {
+      const advanced = document.getElementById('slaAdvancedSection');
+      if (settingsDirty || (advanced?.classList.contains('open') && advanced.contains(document.activeElement))) {
+        return;
+      }
       for (const [inputId, settingKey] of Object.entries(inputMap)) {
         const el = document.getElementById(inputId);
         if (el && settings[settingKey] !== undefined) {
@@ -646,7 +687,8 @@
       for (const [inputId, settingKey] of Object.entries(inputMap)) {
         const el = document.getElementById(inputId);
         if (!el) continue;
-        const n = parseInt(el.value, 10);
+        const raw = String(el.value || '').trim();
+        const n = /^-?\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
         values[settingKey] = Number.isFinite(n) ? n : el.value;
       }
       return values;
@@ -680,23 +722,29 @@
       document.getElementById('edgeState').textContent = connected.includes('Edge') ? 'Connesso' : 'Offline';
     }
 
-    function renderPagesList(pages = []) {
+    function renderPagesList(pages = [], selectedPageId = '') {
       const body = document.getElementById('pagesTableBody');
       if (!body) return;
+      const hash = JSON.stringify({pages, selectedPageId});
+      if (hash === lastPagesHash) return;
+      lastPagesHash = hash;
 
       if (!Array.isArray(pages) || pages.length === 0) {
         body.innerHTML = '<tr><td colspan="4" style="text-align:center; color:#64748b;">Nessuna tab rilevata</td></tr>';
         return;
       }
 
-      body.innerHTML = pages.map((page) => `
-        <tr>
-          <td><button class="btn" style="padding:6px 10px; font-size:12px;" data-page-id="${toSafe(page.page_id, '')}" data-action="selectPage">Usa questa tab</button></td>
-          <td>${toSafe(page.browser, '-')}</td>
-          <td><span style="display:inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${toSafe(page.title, '-')}">${toSafe(page.title, '-')}</span></td>
-          <td>${page.is_sentinel ? 'Sì' : 'No'}</td>
+      body.innerHTML = pages.map((page) => {
+        const pageId = String(page.page_id || '');
+        const selected = pageId && pageId === selectedPageId;
+        return `
+        <tr style="${selected ? 'background:#eff6ff;' : ''}">
+          <td><button class="btn compact" data-page-id="${escapeAttr(page.page_id || '')}" data-action="selectPage">Usa questa tab</button></td>
+          <td>${escapeHtml(page.browser || '-')}</td>
+          <td><span style="display:inline-block; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${escapeAttr(page.title || '-')}">${escapeHtml(page.title || '-')}</span></td>
+          <td>${selected ? 'Selezionata' : (page.is_sentinel ? 'Sì' : 'No')}</td>
         </tr>
-      `).join('');
+      `;}).join('');
     }
 
     function formatTimeOrDash(v) {
@@ -708,39 +756,78 @@
       }
     }
 
+    function parseSentinelDate(value) {
+      const raw = toSafe(value, '');
+      if (!raw) return null;
+      const direct = new Date(raw);
+      if (!Number.isNaN(direct.getTime())) return direct;
+      const m = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4}),?\s+(\d{1,2}):(\d{2})(?::\d{2})?\s*(AM|PM)?/i);
+      if (!m) return null;
+      const month = parseInt(m[1], 10) - 1;
+      const day = parseInt(m[2], 10);
+      let year = parseInt(m[3], 10);
+      let hour = parseInt(m[4], 10);
+      const minute = parseInt(m[5], 10);
+      const ampm = (m[6] || '').toUpperCase();
+      if (year < 100) year += 2000;
+      if (ampm === 'PM' && hour < 12) hour += 12;
+      if (ampm === 'AM' && hour === 12) hour = 0;
+      return new Date(year, month, day, hour, minute);
+    }
 
-    function renderIncidents(incidents = []) {
+    function remainingFromCreated(created, targetMinutes) {
+      const dt = parseSentinelDate(created);
+      const target = parseInt(targetMinutes, 10);
+      if (!dt || !Number.isFinite(target)) return null;
+      const age = Math.floor((Date.now() - dt.getTime()) / 60000);
+      return target - age;
+    }
+
+    function formatRemaining(value) {
+      if (value === null || value === undefined || Number.isNaN(value)) return '-';
+      if (value > 0) return `${value} min`;
+      if (value === 0) return '0 min';
+      return `OVERDUE ${Math.abs(value)} min`;
+    }
+
+    function renderIncidents(incidents = [], settings = {}) {
       const body = document.getElementById('incidentsTableBody');
       if (!body) return;
 
       const safeIncidents = Array.isArray(incidents) ? incidents : [];
+      const hash = JSON.stringify({safeIncidents, settings});
+      if (hash === lastIncidentsHash) return;
+      lastIncidentsHash = hash;
 
       if (!safeIncidents.length) {
-        body.innerHTML = '<tr><td colspan="11" style="text-align:center; color:#64748b;">Nessun incidente</td></tr>';
+        body.innerHTML = '<tr><td colspan="12" style="text-align:center; color:#64748b;">Nessun incidente</td></tr>';
         return;
       }
 
       body.innerHTML = safeIncidents.map((inc) => {
         const sev = toSafe(inc.severity, '-');
         const sevTag = severityClass(sev);
+        const sevKey = sev.toLowerCase();
         const severityText = sev.charAt(0).toUpperCase() + sev.slice(1).toLowerCase();
+        const takeRemaining = formatRemaining(remainingFromCreated(inc.created_time, settings[`sla_${sevKey}_minutes`]));
+        const notifyRemaining = formatRemaining(remainingFromCreated(inc.created_time, settings[`notification_${sevKey}_minutes`]));
         return `
           <tr>
             <td>
-              <button class="btn ghost" style="padding:6px 8px; font-size:12px;" data-action="ignore" data-incident="${toSafe(inc.incident_key, '')}" title="Ignora questo alert">Ignora</button>
-              <button class="btn danger" style="padding:6px 8px; font-size:12px;" data-action="dismiss" data-incident="${toSafe(inc.incident_key, '')}" title="Rimuovi alert dal database">✕</button>
+              <button class="btn ghost compact" data-action="ignore" data-incident="${escapeAttr(inc.incident_key || '')}" title="Ignora questo alert">Ignora</button>
+              <button class="btn danger compact" data-action="dismiss" data-incident="${escapeAttr(inc.incident_key || '')}" aria-label="Rimuovi alert ${escapeAttr(inc.incident_key || '')} dal database" title="Rimuovi alert dal database">Rimuovi</button>
             </td>
-            <td>${toSafe(inc.incident_key)}</td>
-            <td><span class="${sevTag}">${severityText}</span></td>
-            <td>${toSafe(inc.status)}</td>
-            <td>${toSafe(inc.owner, '-')}</td>
-            <td>${toSafe(inc.title)}</td>
-            <td>${toSafe(inc.created_time, '-')}</td>
-            <td>${toSafe(inc.last_sla_warning_at, '-')}</td>
-            <td>${toSafe(inc.last_update_time, '-')}</td>
-            <td>${toSafe(inc.first_seen_active, '-')}</td>
-            <td>${toSafe(inc.activated_at, '-')}</td>
-            <td>${toSafe(inc.last_seen, '-')}</td>
+            <td>${escapeHtml(inc.incident_key)}</td>
+            <td><span class="${sevTag}">${escapeHtml(severityText)}</span></td>
+            <td>${escapeHtml(inc.status)}</td>
+            <td>${escapeHtml(inc.owner || '-')}</td>
+            <td>${escapeHtml(inc.title)}</td>
+            <td>${escapeHtml(inc.created_time || '-')}</td>
+            <td>${escapeHtml(takeRemaining)}</td>
+            <td>${escapeHtml(notifyRemaining)}</td>
+            <td>${escapeHtml(inc.last_sla_warning_at || '-')}</td>
+            <td>${escapeHtml(inc.last_update_time || '-')}</td>
+            <td>${escapeHtml(inc.last_seen || '-')}</td>
           </tr>
         `;
       }).join('');
@@ -749,6 +836,9 @@
     function renderActions(actions = []) {
       const body = document.getElementById('logsTableBody');
       if (!body) return;
+      const hash = JSON.stringify(actions || []);
+      if (hash === lastActionsHash) return;
+      lastActionsHash = hash;
       if (!actions.length) {
         body.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#64748b;">Nessun log</td></tr>';
         return;
@@ -756,11 +846,11 @@
 
       body.innerHTML = actions.map((a) => `
         <tr>
-          <td>${formatTimeOrDash(a.ts)}</td>
-          <td>${toSafe(a.incident_key)}</td>
-          <td>${toSafe(a.action)}</td>
-          <td>${toSafe(a.result)}</td>
-          <td>${toSafe(a.details)}</td>
+          <td>${escapeHtml(formatTimeOrDash(a.ts))}</td>
+          <td>${escapeHtml(a.incident_key)}</td>
+          <td>${escapeHtml(a.action)}</td>
+          <td>${escapeHtml(a.result)}</td>
+          <td>${escapeHtml(a.details)}</td>
         </tr>
       `).join('');
     }
@@ -791,9 +881,9 @@
       refreshInProgress = true;
       try {
       const state = await apiCall('get_state');
-      if (!state) return;
+      if (!state || state.ok === false) return;
 
-      const { status, runtime = {}, settings = {}, pages = [], connected = [], incidents = [], actions = [], worker_alive = true } = state;
+      const { status, runtime = {}, settings = {}, pages = [], connected = [], incidents = [], actions = [], selected_page_id = '', worker_alive = true } = state;
       if (status) {
         document.getElementById('runtimeBadge').textContent = status;
       }
@@ -804,12 +894,24 @@
       isPaused = !!runtime.paused;
       const pauseBtn = document.getElementById('pauseResumeBtn');
       if (pauseBtn) pauseBtn.textContent = isPaused ? 'Riprendi' : 'Pausa';
+      const busy = !!runtime.operation_in_progress || !!runtime.starting;
+      const startBtn = document.getElementById('startBtn');
+      const fetchBtn = document.getElementById('fetchBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      if (startBtn) startBtn.disabled = busy || !!runtime.running_monitor;
+      if (fetchBtn) fetchBtn.disabled = busy || (!!runtime.running_monitor && !runtime.paused);
+      if (pauseBtn) pauseBtn.disabled = !!runtime.starting || (!runtime.running_monitor && !runtime.paused);
+      if (stopBtn) stopBtn.disabled = !busy && !runtime.running_monitor && !runtime.paused;
+      const notificationsState = document.getElementById('notificationsState');
+      if (notificationsState) {
+        notificationsState.textContent = worker_alive === false ? 'Off' : (runtime.dry_run ? 'Dry-run' : 'On');
+      }
 
       setMatrix(settings);
       fillInputs(settings);
       renderWorkspace(pages, connected);
-      renderPagesList(pages);
-      renderIncidents(incidents);
+      renderPagesList(pages, selected_page_id);
+      renderIncidents(incidents, settings);
       renderActions(actions);
       } finally {
         refreshInProgress = false;
@@ -829,6 +931,11 @@
     const slaAdvancedToggle = document.getElementById('toggleSlaAdvancedBtn');
     const slaAdvancedClose = document.getElementById('closeSlaAdvancedBtn');
     const slaAdvancedSection = document.getElementById('slaAdvancedSection');
+    document.querySelectorAll('#slaAdvancedSection .input').forEach((input) => {
+      input.addEventListener('input', () => {
+        settingsDirty = true;
+      });
+    });
     slaAdvancedToggle?.addEventListener('click', () => {
       if (!slaAdvancedSection) return;
       const isOpen = slaAdvancedSection.classList.toggle('open');
@@ -874,6 +981,7 @@
     });
     document.getElementById('saveSettingsBtn')?.addEventListener('click', async () => {
       await apiCall('save_settings', collectSettings());
+      settingsDirty = false;
       await refreshState();
     });
     document.getElementById('pagesTableBody')?.addEventListener('click', (event) => {
