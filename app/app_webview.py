@@ -24,21 +24,22 @@ core = _load_core()
 
 def _launch_browser_process(browser):
     browser = (browser or "").strip().lower()
+    core.log_file("WEBVIEW_LAUNCH_BROWSER_START", f"browser={browser}")
     if browser not in ("chrome", "edge"):
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};reason=invalid")
         return False, "Browser non valido"
 
     exe = core.find_chrome_path() if browser == "chrome" else core.find_edge_path()
     if not exe:
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};reason=not_found")
         return False, f"{browser} non trovato"
 
     port = core.CHROME_DEBUG_PORT if browser == "chrome" else core.EDGE_DEBUG_PORT
-    try:
-        import urllib.request
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
-            if 200 <= getattr(resp, "status", 0) < 400:
-                return True, ""
-    except Exception:
-        pass
+    if core._debug_port_alive(port):
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_ready")
+        return True, ""
+
+    core.terminate_debug_port_owner(browser, port, reason="webview_launch_debug_port_not_responding")
 
     profile_dir = core.browser_profile_dir(browser)
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -63,9 +64,15 @@ def _launch_browser_process(browser):
     ]
 
     try:
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True, ""
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_OK", f"browser={browser};port={port};pid={proc.pid};profile={profile_dir}")
+        if core.wait_debug_port_alive(port, timeout_seconds=12):
+            core.log_file("WEBVIEW_LAUNCH_BROWSER_READY", f"browser={browser};port={port};pid={proc.pid}")
+            return True, ""
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_NOT_READY", f"browser={browser};port={port};pid={proc.pid}")
+        return False, f"{browser} avviato ma porta debug {port} non pronta"
     except Exception as exc:
+        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};port={port};err={type(exc).__name__}: {exc}")
         return False, str(exc)
 
 
@@ -185,9 +192,15 @@ class WebViewApi:
         return self._send("refresh_pages")
 
     def launch_browser(self, browser):
+        with self._lock:
+            self._state["status"] = f"Avvio {browser} debug in corso..."
         ok, err = _launch_browser_process(browser)
         if not ok:
+            with self._lock:
+                self._state["status"] = err
             return {"ok": False, "error": err}
+        with self._lock:
+            self._state["status"] = f"{browser} debug avviato. Aggiornamento tab..."
         self.refresh_pages()
         return {"ok": True}
 

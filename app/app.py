@@ -2592,6 +2592,49 @@ def _debug_port_alive(port):
     except Exception:
         return False
 
+def _debug_port_owner_pids(port):
+    pids = set()
+    try:
+        out = subprocess.check_output(['netstat', '-ano'], text=True, stderr=subprocess.DEVNULL)
+        needle = f":{int(port)}"
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            local = parts[1]
+            state = parts[3]
+            pid = parts[-1]
+            if local.endswith(needle) and state.upper() in ('LISTENING', 'ESTABLISHED', 'CLOSE_WAIT', 'SYN_SENT', 'SYN_RECEIVED'):
+                try:
+                    pids.add(int(pid))
+                except Exception:
+                    pass
+    except Exception as exc:
+        log_file("DEBUG_PORT_OWNER_FAIL", f"port={port};err={type(exc).__name__}: {exc}")
+    return sorted(pids)
+
+def terminate_debug_port_owner(browser, port, reason='stale_debug_port'):
+    killed = []
+    for pid in _debug_port_owner_pids(port):
+        try:
+            result = subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            if result.returncode == 0:
+                killed.append(pid)
+        except Exception as exc:
+            log_file("DEBUG_PORT_KILL_FAIL", f"browser={browser};port={port};pid={pid};reason={reason};err={type(exc).__name__}: {exc}")
+    if killed:
+        log_file("DEBUG_PORT_KILL", f"browser={browser};port={port};reason={reason};pids={killed}")
+        time.sleep(1)
+    return killed
+
+def wait_debug_port_alive(port, timeout_seconds=12):
+    deadline = time.time() + max(1, int(timeout_seconds))
+    while time.time() < deadline:
+        if _debug_port_alive(port):
+            return True
+        time.sleep(0.5)
+    return False
+
 def launch_browser_debug(browser):
     """
     Avvia un'istanza Chromium debuggabile e separata dalle finestre normali.
@@ -2609,6 +2652,8 @@ def launch_browser_debug(browser):
     if _debug_port_alive(port):
         log_file("LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_listening")
         return True
+
+    terminate_debug_port_owner(browser, port, reason='launch_debug_port_not_responding')
 
     profile_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2635,7 +2680,11 @@ def launch_browser_debug(browser):
     try:
         proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log_file("LAUNCH_BROWSER_OK", f"browser={browser};profile={profile_dir};pid={proc.pid}")
-        return True
+        if wait_debug_port_alive(port, timeout_seconds=12):
+            log_file("LAUNCH_BROWSER_READY", f"browser={browser};port={port};pid={proc.pid}")
+            return True
+        log_file("LAUNCH_BROWSER_NOT_READY", f"browser={browser};port={port};pid={proc.pid}")
+        return False
     except Exception as e:
         log_file("LAUNCH_BROWSER_FAIL", f"browser={browser};err={str(e)}")
         messagebox.showerror('Errore avvio browser', str(e))
