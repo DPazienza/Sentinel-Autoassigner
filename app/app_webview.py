@@ -2,9 +2,10 @@
 import importlib.util
 import copy
 import queue
-import subprocess
 from pathlib import Path
 import threading
+
+from browser_runtime import launch_controlled_browser
 
 ROOT = Path(__file__).resolve().parent
 APP_MODULE_PATH = ROOT / "app.py"
@@ -23,64 +24,8 @@ core = _load_core()
 
 
 def _launch_browser_process(browser):
-    browser = (browser or "").strip().lower()
-    core.log_file("WEBVIEW_LAUNCH_BROWSER_START", f"browser={browser}")
-    if browser not in ("chrome", "edge"):
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};reason=invalid")
-        return False, "Browser non valido"
-
-    exe = core.find_chrome_path() if browser == "chrome" else core.find_edge_path()
-    if not exe:
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};reason=not_found")
-        return False, f"{browser} non trovato"
-
-    port = core.CHROME_DEBUG_PORT if browser == "chrome" else core.EDGE_DEBUG_PORT
-    if core._debug_port_alive(port):
-        owner_pids = [
-            pid for pid in core._debug_port_owner_pids(port)
-            if core._is_owned_debug_browser_process(pid, browser, port)
-        ]
-        if not owner_pids:
-            core.log_file("WEBVIEW_LAUNCH_BROWSER_BLOCKED", f"browser={browser};port={port};reason=debug_port_not_owned")
-            return False, f"Porta debug {port} gia attiva ma non appartiene al profilo controllato dell'app"
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_ready")
-        return True, ""
-
-    core.terminate_debug_port_owner(browser, port, reason="webview_launch_debug_port_not_responding")
-
-    profile_dir = core.browser_profile_dir(browser)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    args = [
-        str(exe),
-        f"--remote-debugging-port={port}",
-        "--remote-debugging-address=127.0.0.1",
-        "--remote-allow-origins=*",
-        f"--user-data-dir={str(profile_dir)}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--restore-last-session",
-        "--hide-crash-restore-bubble",
-        "--start-minimized",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-background-timer-throttling",
-        "--disable-features=CalculateNativeWinOcclusion",
-        "--new-window",
-        "https://portal.azure.com/",
-    ]
-
-    try:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_OK", f"browser={browser};port={port};pid={proc.pid};profile={profile_dir}")
-        if core.wait_debug_port_alive(port, timeout_seconds=12):
-            core.log_file("WEBVIEW_LAUNCH_BROWSER_READY", f"browser={browser};port={port};pid={proc.pid}")
-            return True, ""
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_NOT_READY", f"browser={browser};port={port};pid={proc.pid}")
-        return False, f"{browser} avviato ma porta debug {port} non pronta"
-    except Exception as exc:
-        core.log_file("WEBVIEW_LAUNCH_BROWSER_FAIL", f"browser={browser};port={port};err={type(exc).__name__}: {exc}")
-        return False, str(exc)
+    result = launch_controlled_browser(core, browser)
+    return result.ok, result.error
 
 
 class WebViewApi:
@@ -92,6 +37,7 @@ class WebViewApi:
         self._lock = threading.RLock()
         self._running = True
         self._launching_browsers = set()
+        self._pending_commands = set()
         self._state = {
             "status": "Worker pronto. Seleziona o avvia una tab Sentinel.",
             "runtime": self._snapshot_runtime(),
@@ -170,12 +116,30 @@ class WebViewApi:
                         action = msg.get("action") or ""
                         sev = msg.get("severity") or ""
                         key = msg.get("incident_key") or "-"
+                        result = "CONFIRMED" if action == "confirm" else "DISMISSED"
+                        self.store.log_action(
+                            key,
+                            msg.get("incident_title") or "-",
+                            "SLA_NOTIFICATION_ACTION",
+                            result,
+                            f"action={action};severity={sev}",
+                        )
+                        self._state["actions"] = self.store.actions()
                         self._state["status"] = f"Notifica Windows {action}: {sev.upper()} {key}"
+
+                    elif kind == "sla_confirm":
+                        sev = msg.get("severity") or ""
+                        key = msg.get("incident_key") or "-"
+                        self._state["status"] = f"Notifica Windows confermata: {sev.upper()} {key}"
+
+                    elif kind == "command_complete":
+                        self._pending_commands.discard(msg.get("action"))
 
                     elif kind == "error":
                         self._state["status"] = msg.get("message") or "Errore"
                         self._state["actions"] = msg.get("actions") or self._state.get("actions", [])
 
+                    self._state["selected_page_id"] = self.worker.target_page_id
                     self._state["runtime"] = self._snapshot_runtime()
                     self._state["worker_alive"] = bool(self.worker and self.worker.is_alive())
             except Exception as exc:
@@ -190,7 +154,18 @@ class WebViewApi:
                 self._state["status"] = "Worker non attivo: riavvia l'app."
                 self._state["worker_alive"] = False
             return {"ok": False, "error": "Worker non attivo: riavvia l'app."}
-        self.in_q.put({"action": action, **kwargs})
+        coalesced_actions = {"fetch", "start", "refresh_pages"}
+        with self._lock:
+            if action in coalesced_actions and action in self._pending_commands:
+                return {"ok": True, "queued": False}
+            if action in coalesced_actions:
+                self._pending_commands.add(action)
+        try:
+            self.in_q.put({"action": action, **kwargs})
+        except Exception:
+            with self._lock:
+                self._pending_commands.discard(action)
+            raise
         return {"ok": True}
 
     def _apply_immediate_control(self, action):
@@ -198,32 +173,15 @@ class WebViewApi:
             if not self.worker:
                 return
             if action == "pause":
-                self.worker.set_runtime_state(paused=True, auto_fetch_enabled=False)
+                self.worker.request_pause()
                 with self._lock:
                     self._state["status"] = "Pausa richiesta. Stop scan in corso appena possibile."
             elif action == "stop":
-                self.worker.set_runtime_state(
-                    running_monitor=False,
-                    paused=False,
-                    starting=False,
-                    auto_fetch_enabled=False,
-                    stop_requested=True,
-                )
-                try:
-                    self.worker.session_first_notified_keys.clear()
-                except Exception:
-                    pass
+                self.worker.request_stop()
                 with self._lock:
                     self._state["status"] = "Stop richiesto. Operazioni in corso in chiusura."
             elif action == "shutdown":
-                self.worker.set_runtime_state(
-                    running_monitor=False,
-                    paused=False,
-                    starting=False,
-                    auto_fetch_enabled=False,
-                    shutdown_requested=True,
-                    stop_requested=True,
-                )
+                self.worker.request_stop(shutdown=True)
                 with self._lock:
                     self._state["status"] = "Chiusura worker richiesta."
         except Exception as exc:
@@ -340,13 +298,15 @@ class WebViewApi:
         return result
 
     def shutdown(self):
+        if not self._running:
+            return {"ok": True}
         result = self._send("shutdown")
         self._running = False
         return result
 
 
 def _build_window_html():
-    html_path = ROOT / "ui-demo-light-simple-dashboard.html"
+    html_path = ROOT / "dashboard.html"
     return html_path.read_text(encoding="utf-8")
 
 
@@ -363,7 +323,11 @@ def run_webview(debug=False):
 
     in_q = queue.Queue()
     out_q = queue.Queue()
+    core.set_windows_notification_action_sink(
+        lambda payload: out_q.put({**payload, "kind": "sla_action"})
+    )
     worker = core.NotifierWorker(in_q, out_q, store)
+    worker.browser_relauncher = lambda browser: _launch_browser_process(browser)[0]
     worker.start()
 
     api = WebViewApi(store, worker, in_q, out_q)
@@ -401,7 +365,7 @@ def run_webview(debug=False):
         except Exception:
             pass
         try:
-            worker.join(timeout=2)
+            worker.join(timeout=20)
         except Exception:
             pass
         if worker.is_alive():
@@ -411,6 +375,7 @@ def run_webview(debug=False):
                 worker.cleanup_playwright()
             except Exception:
                 pass
+        core.set_windows_notification_action_sink(None)
 
 
 def run_tk():

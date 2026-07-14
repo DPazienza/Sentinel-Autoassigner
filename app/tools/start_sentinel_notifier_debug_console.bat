@@ -23,7 +23,7 @@ echo   start_sentinel_notifier_windows.bat
 echo ============================================================
 echo.
 
-python ..\app.py
+python ..\app_webview.py --ui webview --debug
 
 pause
 exit /b 0

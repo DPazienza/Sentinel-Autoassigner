@@ -1006,8 +1006,11 @@
       }
     });
 
-    setInterval(refreshState, 1200);
-    refreshState();
+    async function scheduleStateRefresh() {
+      await refreshState();
+      window.setTimeout(scheduleStateRefresh, document.hidden ? 5000 : 1200);
+    }
+    scheduleStateRefresh();
   </script>
 </body>
 </html>

@@ -1,46 +1,24 @@
 ﻿
-import argparse, copy, math, os, queue, re, shutil, sqlite3, subprocess, threading, time, tkinter as tk, sys, traceback
+import argparse, copy, math, os, queue, re, sqlite3, subprocess, threading, time, tkinter as tk, sys
 import html
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
-from typing import Any, Dict, List, Optional, Tuple
 from playwright.sync_api import sync_playwright
+from runtime_logging import log_file
+from browser_runtime import launch_controlled_browser
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-LOG_DIR = BASE_DIR / "logs"
 DB_PATH = DATA_DIR / "bot_state.sqlite3"
 BROWSER_PROFILE_DIR = BASE_DIR / "browser_profiles"
 DATA_DIR.mkdir(exist_ok=True)
-LOG_DIR.mkdir(exist_ok=True)
 BROWSER_PROFILE_DIR.mkdir(exist_ok=True)
 CHROME_DEBUG_PORT = 9222
 EDGE_DEBUG_PORT = 9223
-ENABLE_ASSIGNMENT_WORKFLOW = False
+ENABLE_ASSIGNMENT_WORKFLOW = True
 KEEP_WINDOWS_AWAKE = True
-
-APP_LOG_PATH = LOG_DIR / "app.log"
-
-def log_file(event, details="", exc=None):
-    """
-    Append diagnostic information to logs/app.log.
-    This is intentionally simple and dependency-free so it also works when UI/DB logging fails.
-    """
-    try:
-        ts = datetime.now().isoformat(timespec="seconds")
-        thread_name = threading.current_thread().name
-        msg = f"[{ts}] [{thread_name}] {event}"
-        if details:
-            msg += f" | {details}"
-        if exc is not None:
-            msg += "\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-        with APP_LOG_PATH.open("a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-    except Exception:
-        pass
-
 
 def enable_windows_background_runtime():
     """
@@ -54,9 +32,8 @@ def enable_windows_background_runtime():
         import ctypes
         ES_CONTINUOUS = 0x80000000
         ES_SYSTEM_REQUIRED = 0x00000001
-        ES_AWAYMODE_REQUIRED = 0x00000040
         result = ctypes.windll.kernel32.SetThreadExecutionState(
-            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
         )
         log_file("WINDOWS_KEEP_AWAKE", f"enabled={bool(result)}")
         return bool(result)
@@ -124,6 +101,23 @@ def normalize_severity(v):
         'informational': 'Informational',
     }
     return valid.get(s, '')
+def resolve_incident_severity(row_value='', detail_value='', incident_key=''):
+    """
+    Prefer the severity parsed from the exact incident grid row.
+
+    The Sentinel detail pane shares its DOM with page-level severity counters and
+    accessibility text, so its value is only a fallback. This prevents a Medium
+    row from being persisted/notified as High when the pane parser sees unrelated
+    page text.
+    """
+    row_severity = normalize_severity(row_value)
+    detail_severity = normalize_severity(detail_value)
+    if row_severity and detail_severity and row_severity != detail_severity:
+        log_file(
+            'SEVERITY_SOURCE_MISMATCH',
+            f'key={incident_key or "-"};row={row_severity};detail={detail_severity};selected={row_severity}'
+        )
+    return row_severity or detail_severity
 def clean_owner_identity(v):
     text = normalize_text(v)
     if not text:
@@ -446,78 +440,36 @@ def _notify_windows_toast(title, message, sev='medium', timeout=15, incident_key
         return False, False
     sev = (sev or '').strip().lower()
     is_urgent = sev in ('critical', 'high')
-    scenario = 'urgent' if is_urgent else 'reminder'
-    duration = 'long' if is_urgent else 'short'
-    title_xml = html.escape(title or 'Sentinel')
-    message_xml = html.escape(message or '')
     log_file("WINDOWS_TOAST_START", f"incident_key={incident_key};severity={sev};urgent={is_urgent};message_len={len(str(message or ''))}")
-
-    # Native Windows Toast with action buttons (Confirm/Dismiss for critical & high).
-    # Prefer winsdk if installed, then fallback to winrt namespace.
     try:
-        try:
-            from winsdk.windows.ui.notifications import ToastNotification, ToastNotificationManager
-            from winsdk.windows.data.xml.dom import XmlDocument
-        except Exception:
-            from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
-            from winrt.windows.data.xml.dom import XmlDocument
-        # Raw winsdk/winrt activation is not wired to this app. Keep this
-        # passive; actionable confirm/dismiss is only reported when winotify
-        # callback hooks are actually registered.
-        actions = ""
-        toast_xml = (
-            "<toast"
-            f" scenario='{scenario}' duration='{duration}' launch='sentinel-notify'>"
-            "<visual><binding template='ToastGeneric'>"
-            f"<text>{title_xml}</text>"
-            f"<text>{message_xml}</text>"
-            "</binding></visual>"
-            f"{actions}"
-            "<audio src='ms-winsoundevent:Notification.IM'/>"
-            "</toast>"
-        )
-        doc = XmlDocument()
-        doc.load_xml(toast_xml)
-        notifier = ToastNotificationManager.create_toast_notifier("Sentinel.Notifier")
-        notification = ToastNotification(doc)
-        notifier.show(notification)
-        log_file("WINDOWS_TOAST_OK", f"incident_key={incident_key};severity={sev};urgent={is_urgent};action_hooks=False")
-        return True, False
-    except Exception as e:
-        log_file("WINDOWS_TOAST_FAIL", f"severity={sev}; err={str(e)}")
-        # Fallback with winotify (py package available on this environment).
-        try:
-            from winotify import Notification, audio
-            winotify_notifier = _get_winotify_notifier()
-            if winotify_notifier is not None:
-                n = winotify_notifier.create_notification(
-                    title=title,
-                    msg=message,
-                    duration='long' if is_urgent else 'short'
-                )
-                if is_urgent:
-                    n.set_audio(audio.Default, False)
-                else:
-                    n.set_audio(audio.Silent, False)
+        from winotify import audio
 
-                action_hooks = False
-                if is_urgent:
-                    on_conf = _winotify_action_handler('confirm', incident_key, incident_title, sev)
-                    on_dismiss = _winotify_action_handler('dismiss', incident_key, incident_title, sev)
-                    if on_conf is not None:
-                        n.add_actions('Conferma', on_conf)
-                        action_hooks = True
-                    if on_dismiss is not None:
-                        n.add_actions('Ignora', on_dismiss)
-                        action_hooks = True
-
-                n.show()
-                log_file("WINDOWS_WINOTIFY_OK", f"incident_key={incident_key};severity={sev};action_hooks={action_hooks}")
-                return True, action_hooks
-        except Exception as e2:
-            log_file("WINDOWS_TOAST_FAIL_WINOTIFY", f"severity={sev}; err={str(e2)}")
+        notifier = _get_winotify_notifier()
+        if notifier is None:
             return False, False
+        notification = notifier.create_notification(
+            title=title,
+            msg=message,
+            duration='long' if is_urgent else 'short'
+        )
+        notification.set_audio(audio.Default if is_urgent else audio.Silent, False)
 
+        actionable = False
+        if is_urgent:
+            confirm = _winotify_action_handler('confirm', incident_key, incident_title, sev)
+            dismiss = _winotify_action_handler('dismiss', incident_key, incident_title, sev)
+            if confirm is not None:
+                notification.add_actions('Conferma', confirm)
+                actionable = True
+            if dismiss is not None:
+                notification.add_actions('Ignora', dismiss)
+                actionable = True
+
+        notification.show()
+        log_file("WINDOWS_WINOTIFY_OK", f"incident_key={incident_key};severity={sev};action_hooks={actionable}")
+        return True, actionable
+    except Exception as exc:
+        log_file("WINDOWS_TOAST_FAIL_WINOTIFY", f"severity={sev};err={type(exc).__name__}:{exc}", exc)
         return False, False
 
 
@@ -756,30 +708,32 @@ class Storage:
                 (key,title,severity,status,owner,created,last_update,first_active,workspace,source))
         self._with_db_retry(_op)
 
-    def mark_activated(self, key, title, severity="", created="", last_update="", workspace="", source=""):
+    def mark_activated(self, key, title, severity="", owner="", created="", last_update="", workspace="", source="", activated_by_bot=True):
         if self.is_hidden(key):
             log_file("MARK_ACTIVE_SKIPPED_HIDDEN", f"key={key}")
             return
         severity = normalize_severity(severity)
+        owner = clean_owner_identity(owner) or 'me'
+        activated_flag = 1 if activated_by_bot else 0
         ts = now_iso()
-        log_file("MARK_ACTIVATED", f"key={key};severity={severity};workspace={workspace};source={source}")
+        log_file("MARK_ACTIVATED", f"key={key};severity={severity};owner={owner};by_bot={activated_flag};workspace={workspace};source={source}")
         def _op(con):
             con.execute('''INSERT INTO incidents(incident_key,title,severity,status,owner,created_time,last_update_time,activated_at,activated_by_bot,first_seen_active,workspace_hint,source_page)
-                VALUES(?,?,?,'Active','me',?,?,?,?,1,?,?)
+                VALUES(?,?,?,'Active',?,?,?,?,?,?,?,?)
                 ON CONFLICT(incident_key) DO UPDATE SET title=excluded.title, severity=COALESCE(NULLIF(excluded.severity,''),incidents.severity),
                 first_alert_notified=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.first_alert_notified END,
                 first_alert_notified_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.first_alert_notified_at END,
                 sla_warning_sent=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN 0 ELSE incidents.sla_warning_sent END,
                 last_sla_warning_at=CASE WHEN NULLIF(excluded.severity,'') IS NOT NULL AND LOWER(COALESCE(incidents.severity,'')) <> LOWER(excluded.severity) THEN NULL ELSE incidents.last_sla_warning_at END,
-                status='Active', owner='me', created_time=COALESCE(NULLIF(excluded.created_time,''),incidents.created_time),
+                status='Active', owner=COALESCE(NULLIF(excluded.owner,''),incidents.owner), created_time=COALESCE(NULLIF(excluded.created_time,''),incidents.created_time),
                 last_update_time=COALESCE(NULLIF(excluded.last_update_time,''),incidents.last_update_time),
-                activated_at=COALESCE(incidents.activated_at,excluded.activated_at), activated_by_bot=1,
+                activated_at=COALESCE(incidents.activated_at,excluded.activated_at), activated_by_bot=excluded.activated_by_bot,
                 first_seen_active=COALESCE(incidents.first_seen_active,excluded.first_seen_active),
                 workspace_hint=COALESCE(NULLIF(excluded.workspace_hint,''),incidents.workspace_hint), source_page=COALESCE(NULLIF(excluded.source_page,''),incidents.source_page)''',
-                (key,title,severity,created,last_update,ts,ts,workspace,source))
+                (key,title,severity,owner,created,last_update,ts,activated_flag,ts,workspace,source))
         self._with_db_retry(_op)
 
-    def sync_visible_incidents(self, visible_keys, clear_when_empty=False):
+    def sync_visible_incidents(self, visible_keys, source_page="", clear_when_empty=False):
         """
         Keep the local dashboard aligned with the current Sentinel Incidents grid.
 
@@ -791,26 +745,32 @@ class Storage:
         - clear_when_empty=True is used only when parser returns a non-empty view.
         """
         keys = [str(k) for k in visible_keys if k]
+        source_page = str(source_page or '').strip()
         sync_status = {
             "status": "SUCCESS",
             "details": ""
         }
 
         def _op(con):
+            if not source_page:
+                sync_status["status"] = "SKIP_NO_SOURCE_SCOPE"
+                sync_status["details"] = "Source page missing; stale cleanup skipped"
+                return sync_status["status"], sync_status["details"]
             if not keys:
                 if clear_when_empty:
-                    stale = [str(r[0]) for r in con.execute("SELECT incident_key FROM incidents").fetchall()]
+                    stale = [str(r[0]) for r in con.execute("SELECT incident_key FROM incidents WHERE source_page=?", (source_page,)).fetchall()]
                     sync_status["status"] = "CLEARED_EMPTY_VIEW"
                     sync_status["details"] = f"No visible incidents in current Sentinel view; removed={len(stale)}"
-                    con.execute("DELETE FROM incidents")
+                    con.execute("DELETE FROM incidents WHERE source_page=?", (source_page,))
                 else:
                     sync_status["status"] = "SKIP_EMPTY_UNSAFE"
                     sync_status["details"] = "Visible incident list empty and clear_when_empty=False"
                 return sync_status["status"], sync_status["details"]
 
             placeholders = ",".join(["?"] * len(keys))
-            stale = [str(r[0]) for r in con.execute(f"SELECT incident_key FROM incidents WHERE incident_key NOT IN ({placeholders})", keys).fetchall()]
-            con.execute(f"DELETE FROM incidents WHERE incident_key NOT IN ({placeholders})", keys)
+            params = [source_page, *keys]
+            stale = [str(r[0]) for r in con.execute(f"SELECT incident_key FROM incidents WHERE source_page=? AND incident_key NOT IN ({placeholders})", params).fetchall()]
+            con.execute(f"DELETE FROM incidents WHERE source_page=? AND incident_key NOT IN ({placeholders})", params)
 
             # Ignored incidents must never reappear in the dashboard.
             try:
@@ -935,23 +895,6 @@ class RuntimeSettings:
         warn_pct = clamp_int(self.notification_warning_percent, 75, 1, 100)
         return max(1, int(math.ceil(self.notification_for(sev) * warn_pct / 100)))
 
-
-def sla_due_from_created(created_time: str, severity: str, settings: RuntimeSettings) -> str:
-    """
-    SLA breach timestamp based on Sentinel Creation time, not activated_at.
-    """
-    if not created_time:
-        return "-"
-    return add_minutes_to_sentinel_datetime(created_time, settings.sla_for(severity))
-
-
-def sla_notify_from_created(created_time: str, severity: str, settings: RuntimeSettings) -> str:
-    """
-    Warning timestamp based on percentage threshold, e.g. 60% of SLA from Created.
-    """
-    if not created_time:
-        return "-"
-    return add_minutes_to_sentinel_datetime(created_time, settings.warning_at(severity))
 
 def runtime_settings_from_storage(store):
     s = RuntimeSettings()
@@ -1273,7 +1216,7 @@ class SentinelPageMonitor:
         if re.search(r"\bUnassigned\b\s+Owner\b", compact, re.I) or re.search(r"\bOwner\b\s+Unassigned\b", compact, re.I):
             owner = 'Unassigned'
         else:
-            owner = self.near_label(lines, 'Owner') or 'Unknown'
+            owner = clean_owner_identity(self.near_label(lines, 'Owner')) or 'Unknown'
 
         for sev in ['Critical', 'High', 'Medium', 'Low', 'Informational']:
             if re.search(rf"\b{sev}\b\s+Severity\b", compact, re.I) or re.search(rf"\bSeverity\b\s+{sev}\b", compact, re.I):
@@ -1301,7 +1244,7 @@ class SentinelPageMonitor:
         if not owner or owner == 'Unknown':
             m = re.search(r"\bOwner\s*[:\-]?\s*([^\n\r;]{1,120})", panel, re.I)
             if m:
-                owner = normalize_text(m.group(1))
+                owner = clean_owner_identity(m.group(1)) or 'Unknown'
 
         if not severity:
             m = re.search(r"\bSeverity\s*[:\-]?\s*([A-Za-z]+)\b", panel, re.I)
@@ -1450,13 +1393,31 @@ class SentinelPageMonitor:
         Verifica reale dalla UI: owner non deve piu' essere Unassigned.
         """
         last_details = None
+        known_owner = clean_owner_identity(getattr(self.settings, 'my_owner_identity', ''))
+        observed_owner = ''
+        confirmations = 0
         for _ in range(max_attempts):
             self.wait(700)
             panel, d = self.read_open_incident_details(incident_key)
             if panel is None or d is None:
                 continue
             last_details = d
-            if not self.owner_is_unassigned(d.get('owner')):
+            owner_after = clean_owner_identity(d.get('owner'))
+            if not owner_after or owner_after.lower() in ('unknown', '-') or self.owner_is_unassigned(owner_after):
+                continue
+            if known_owner:
+                if self.normalize_owner_text(owner_after) != self.normalize_owner_text(known_owner):
+                    log_file("OWNER_VERIFY_MISMATCH", f"key={incident_key};expected={known_owner};actual={owner_after}")
+                    continue
+                d['owner'] = owner_after
+                return True, d
+            if self.normalize_owner_text(owner_after) == self.normalize_owner_text(observed_owner):
+                confirmations += 1
+            else:
+                observed_owner = owner_after
+                confirmations = 1
+            if confirmations >= 2:
+                d['owner'] = owner_after
                 return True, d
         return False, last_details
 
@@ -1672,8 +1633,8 @@ class SentinelPageMonitor:
         return re.sub(r"\s+", " ", (owner or "").strip()).lower()
 
     def owner_is_me(self, owner):
-        owner_norm = self.normalize_owner_text(owner)
-        known_me = self.normalize_owner_text(getattr(self.settings, 'my_owner_identity', ''))
+        owner_norm = self.normalize_owner_text(clean_owner_identity(owner))
+        known_me = self.normalize_owner_text(clean_owner_identity(getattr(self.settings, 'my_owner_identity', '')))
         if not owner_norm or owner_norm in ['unknown', '-']:
             return False
         if self.owner_is_unassigned(owner):
@@ -1807,7 +1768,7 @@ class SentinelPageMonitor:
 
         key = expected_key
         title = fallback_title
-        severity = d.get('severity') or fallback_severity
+        severity = resolve_incident_severity(fallback_severity, d.get('severity'), expected_key)
         status = d['status']
         owner = d['owner']
         workspace = self.workspace_hint()
@@ -1839,6 +1800,7 @@ class SentinelPageMonitor:
             return True, False
 
         processed = False
+        learned_owner_this_run = False
 
         # 1. Owner check: se e' davvero Unassigned, assegna a me.
         # Se non e' Unassigned, non tocca l'owner.
@@ -1860,7 +1822,7 @@ class SentinelPageMonitor:
                 d = result
                 status = d.get('status', status)
                 owner = d.get('owner', owner)
-                severity = d.get('severity') or severity
+                severity = resolve_incident_severity(severity, d.get('severity'), key)
                 self.store.upsert_seen(
                     key, title, severity, status, owner,
                     d.get('created_time', ''), d.get('last_update_time', ''), workspace, source
@@ -1869,11 +1831,14 @@ class SentinelPageMonitor:
             if owner and not self.owner_is_unassigned(owner):
                 owner_identity = clean_owner_identity(owner)
                 if owner_identity:
-                    self.settings.my_owner_identity = owner_identity
-                    try:
-                        self.store.save_settings({'my_owner_identity': owner_identity})
-                    except Exception:
-                        pass
+                    known_owner = clean_owner_identity(getattr(self.settings, 'my_owner_identity', ''))
+                    if not known_owner:
+                        self.settings.my_owner_identity = owner_identity
+                        learned_owner_this_run = True
+                        try:
+                            self.store.save_settings({'my_owner_identity': owner_identity})
+                        except Exception:
+                            pass
                 else:
                     log_file("OWNER_IDENTITY_SKIP", f"key={key};owner={owner}")
             self.store.log_action(key, title, 'WORKFLOW_STEP', 'SUCCESS_VERIFIED', f'owner_before={owner_before}, owner_after={owner}')
@@ -1882,6 +1847,11 @@ class SentinelPageMonitor:
         else:
             self.store.log_action(key, title, 'WORKFLOW_STEP', 'SKIP', f'owner={owner}')
             log_file("PROCESS_INCIDENT_ASSIGN", f"key={key};skip_owner={owner}")
+
+        if learned_owner_this_run:
+            self.store.log_action(key, title, 'SET_ACTIVE', 'DEFER_IDENTITY_LEARNED', f'owner={owner}')
+            log_file("PROCESS_INCIDENT_ACTIVE", f"key={key};defer_after_identity_learning={owner}")
+            return True, processed
 
         # 2. Status check: change Status only if the incident is now assigned to me.
         # If it is assigned to another user, do not assign and do not change status.
@@ -1897,7 +1867,7 @@ class SentinelPageMonitor:
 
         status = d2.get('status', status)
         owner = d2.get('owner', owner)
-        severity = d2.get('severity') or severity
+        severity = resolve_incident_severity(severity, d2.get('severity'), key)
 
         if (not self.owner_is_unassigned(owner)) and (not self.owner_is_me(owner)):
             self.store.log_action(key, title, 'SET_ACTIVE', 'SKIP_OTHER_OWNER_AFTER_REREAD', f'owner={owner}')
@@ -1917,15 +1887,15 @@ class SentinelPageMonitor:
                 d = result
                 status = d.get('status', status)
                 owner = d.get('owner', owner)
-                severity = d.get('severity') or severity
+                severity = resolve_incident_severity(severity, d.get('severity'), key)
                 verified_active = self.status_is_active(status)
 
             # Marca Active solo se la UI ha confermato veramente Active.
             if verified_active:
                 self.store.mark_activated(
-                    key, title, severity,
-                    d2.get('created_time', ''), d2.get('last_update_time', ''),
-                    workspace, source
+                    key, title, severity, owner,
+                    d.get('created_time', ''), d.get('last_update_time', ''),
+                    workspace, source, activated_by_bot=True
                 )
                 self.store.log_action(key, title, 'SET_ACTIVE', 'SUCCESS_VERIFIED', f'status_before={status_before}, status_after={status}')
                 log_file("PROCESS_INCIDENT_ACTIVE", f"key={key};status_before={status_before};status_after={status};verified=true")
@@ -1941,9 +1911,8 @@ class SentinelPageMonitor:
 
         else:
             if self.status_is_active(status):
-                # Traccia comunque gli Active per SLA.
-                self.store.mark_activated(
-                    key, title, severity,
+                self.store.upsert_seen(
+                    key, title, severity, status, owner,
                     d2.get('created_time', ''), d2.get('last_update_time', ''),
                     workspace, source
                 )
@@ -1968,7 +1937,7 @@ class SentinelPageMonitor:
 
         key = str(expected_key).strip()
         title = target.get('title') or key
-        severity = target.get('severity') or ''
+        severity = resolve_incident_severity(target.get('severity') or '', '', key)
 
         status = ''
         owner = ''
@@ -1993,8 +1962,9 @@ class SentinelPageMonitor:
             raise RuntimeError('La tab selezionata non mostra una vista Sentinel Incidents valida.')
 
         start_scan = time.perf_counter()
+        max_rows = 120 if not fetch_only else 15
         snapshot = self.visible_incident_snapshot(
-            max_rows=120 if not fetch_only else 15,
+            max_rows=max_rows,
             row_text_timeout_ms=80 if fetch_only else 800
         )
         snapshot_ms = int((time.perf_counter() - start_scan) * 1000)
@@ -2025,7 +1995,15 @@ class SentinelPageMonitor:
         if not fetch_only:
             keys = [x.get('incident_key') for x in snapshot]
             clear_empty_view = bool(keys) or self.current_view_reports_no_incidents()
-            self.store.sync_visible_incidents(keys, clear_when_empty=clear_empty_view)
+            snapshot_complete = self.can_continue() and len(snapshot) < max_rows
+            if snapshot_complete:
+                self.store.sync_visible_incidents(
+                    keys,
+                    source_page=self.page.url,
+                    clear_when_empty=clear_empty_view,
+                )
+            else:
+                log_file("SYNC_VISIBLE_SKIP", f"reason=partial_or_interrupted;snapshot={len(snapshot)};max_rows={max_rows}")
         else:
             log_file("SYNC_VISIBLE_SKIP", f"fetch_only={fetch_only};snapshot={len(snapshot)}")
 
@@ -2057,7 +2035,50 @@ class SentinelPageMonitor:
 
 class NotifierWorker(threading.Thread):
     def __init__(self, in_q, out_q, store):
-        super().__init__(daemon=True); self.in_q=in_q; self.out_q=out_q; self.store=store; self.settings=runtime_settings_from_storage(store); self.state_lock=threading.RLock(); self.operation_lock=threading.RLock(); self.running_monitor=False; self.paused=False; self.dry_run=True; self.auto_fetch_enabled=False; self.starting=False; self.shutdown_requested=False; self.stop_requested=False; self.target_page_id=None; self.target_page_meta={}; self.pages={}; self.browsers=[]; self.playwright=None; self.last_scan_ts=0; self.last_fetch_ts=0; self.operation_in_progress=False; self.operation_kind=''; self.last_operation_ok=True; self.session_first_notified_keys=set()
+        super().__init__(daemon=True)
+        self.in_q = in_q
+        self.out_q = out_q
+        self.store = store
+        self.settings = runtime_settings_from_storage(store)
+        self.state_lock = threading.RLock()
+        self.operation_lock = threading.RLock()
+        self.running_monitor = False
+        self.paused = False
+        self.dry_run = True
+        self.auto_fetch_enabled = False
+        self.starting = False
+        self.shutdown_requested = False
+        self.stop_requested = False
+        self.target_page_id = None
+        self.target_page_meta = {}
+        self.pages = {}
+        self.browsers = []
+        self.playwright = None
+        self.last_scan_ts = 0
+        self.last_fetch_ts = 0
+        self.operation_in_progress = False
+        self.operation_kind = ''
+        self.last_operation_ok = True
+        self.browser_relauncher = None
+        self.browser_relaunch_after = {}
+
+    def request_pause(self):
+        self.set_runtime_state(paused=True, auto_fetch_enabled=False)
+
+    def request_resume(self):
+        self.set_runtime_state(stop_requested=False, paused=False, running_monitor=True, auto_fetch_enabled=False)
+
+    def request_stop(self, shutdown=False):
+        changes = {
+            'running_monitor': False,
+            'paused': False,
+            'starting': False,
+            'auto_fetch_enabled': False,
+            'stop_requested': True,
+        }
+        if shutdown:
+            changes['shutdown_requested'] = True
+        self.set_runtime_state(**changes)
     def emit(self,kind,payload): self.out_q.put({'kind':kind, **payload})
     def set_runtime_state(self, **changes):
         with self.state_lock:
@@ -2212,13 +2233,12 @@ class NotifierWorker(threading.Thread):
         except Exception as exc:
             log_file("SELECTED_PAGE_RECOVER_REFRESH_FAIL", f"old_target={old_target};reason={reason}", exc)
 
-        candidates = []
-        for pid, page in list(self.pages.items()):
-            if self.page_looks_like_sentinel(page):
+        def collect_candidates():
+            found = []
+            for pid, page in list(self.pages.items()):
+                if not self.page_looks_like_sentinel(page):
+                    continue
                 browser_name = pid.split(':', 1)[0] if ':' in pid else ''
-                priority = 20
-                if preferred_browser and browser_name == preferred_browser:
-                    priority -= 8
                 try:
                     page_url = (page.url or '').strip()
                 except Exception:
@@ -2227,20 +2247,44 @@ class NotifierWorker(threading.Thread):
                     page_title = (page.title() or '').strip()
                 except Exception:
                     page_title = ''
-                if old_url and page_url == old_url:
-                    priority -= 10
-                elif old_url and page_url and old_url.split('#', 1)[0] == page_url.split('#', 1)[0]:
-                    priority -= 6
-                if old_title and page_title == old_title:
-                    priority -= 4
-                candidates.append((priority, pid, page, page_url, page_title, browser_name))
+                found.append((pid, page, page_url, page_title, browser_name))
+            return found
+
+        candidates = collect_candidates()
+        if not candidates and preferred_browser and callable(self.browser_relauncher):
+            now = time.time()
+            if now >= self.browser_relaunch_after:
+                self.browser_relaunch_after = now + 60
+                log_file("SELECTED_PAGE_BROWSER_RELAUNCH", f"browser={preferred_browser};reason={reason}")
+                try:
+                    if self.browser_relauncher(preferred_browser):
+                        self.refresh_pages()
+                        candidates = collect_candidates()
+                except Exception as exc:
+                    log_file("SELECTED_PAGE_BROWSER_RELAUNCH_FAIL", f"browser={preferred_browser};reason={reason}", exc)
 
         if not candidates:
             log_file("SELECTED_PAGE_RECOVER_FAIL", f"old_target={old_target};reason={reason};pages={len(self.pages)}")
             return None
 
-        candidates.sort(key=lambda item: (item[0], item[1]))
-        _, pid, page, page_url, page_title, browser_name = candidates[0]
+        old_base_url = old_url.split('#', 1)[0]
+        match_groups = [
+            [item for item in candidates if old_target and item[0] == old_target],
+            [item for item in candidates if old_url and item[2] == old_url],
+            [item for item in candidates if old_base_url and item[2].split('#', 1)[0] == old_base_url],
+            [item for item in candidates if old_title and item[3] == old_title and item[4] == preferred_browser],
+            [item for item in candidates if preferred_browser and item[4] == preferred_browser],
+            candidates,
+        ]
+        selected = next((group[0] for group in match_groups if len(group) == 1), None)
+        if selected is None:
+            self.request_pause()
+            message = 'Recupero tab Sentinel ambiguo: monitor in pausa. Seleziona nuovamente la tab corretta.'
+            self.emit('error', {'message': message, 'settings': self.settings_dict()})
+            log_file("SELECTED_PAGE_RECOVER_AMBIGUOUS", f"old_target={old_target};reason={reason};candidates={len(candidates)}")
+            return None
+
+        pid, page, page_url, page_title, browser_name = selected
         self.target_page_id = pid
         self.target_page_meta = {'browser': browser_name, 'url': page_url, 'title': page_title}
         self.store.log_system('SELECT_PAGE', 'AUTO_RECOVER', f'old={old_target};new={pid};reason={reason}')
@@ -2303,13 +2347,13 @@ class NotifierWorker(threading.Thread):
 
         self.store.save_settings(self.settings_dict()); self.emit('status', {'message':'Taking Charge / Notification SLA settings saved','settings':self.settings_dict()})
         log_file("WORKER_SETTINGS_UPDATE", f"updated={self.settings_dict()}")
-    def check_sla(self, force_first_alert_for_existing=False):
+    def check_sla(self):
         warnings = 0
         check_started = time.perf_counter()
         ignored = self.store.ignored_keys()
         candidates = self.store.incidents()
         total = len(candidates)
-        log_file("SLA_CHECK_START", f"force_first={force_first_alert_for_existing};candidates={total};ignored_cached={len(ignored)}")
+        log_file("SLA_CHECK_START", f"candidates={total};ignored_cached={len(ignored)}")
         if not total:
             log_file("SLA_CHECK_DONE", f"warnings=0;elapsed_ms=0;total=0")
             return 0
@@ -2342,7 +2386,7 @@ class NotifierWorker(threading.Thread):
             title = inc.get('title') or '-'
             first_alert_notified = int(inc.get('first_alert_notified') or 0)
             should_notify_first = not first_alert_notified
-            if should_notify_first and key not in self.session_first_notified_keys:
+            if should_notify_first:
                 nt = 'Nuovo alert rilevato'
                 message = f'Nuovo alert rilevato: {key} ({sev_label}). {title}'
                 sev_norm = (sev or '').strip().lower()
@@ -2362,7 +2406,6 @@ class NotifierWorker(threading.Thread):
                     if not first_alert_notified:
                         self.store.mark_first_alert_notified(key)
                     self.store.mark_last_seen(key)
-                    self.session_first_notified_keys.add(key)
                     self.store.log_action(key, title, 'NEW_ALERT_NOTIFICATION', 'SENT', f'age={age_label}, created={created}, severity={sev_label}')
                     log_file("SLA_FIRST_NOTIFY", f"key={key};severity={sev_label};age={age_label};first={first_alert_notified}")
                     log_file("SLA_NOTIFY_FLOW", f"key={key};type=first;severity={sev_label};ok=1")
@@ -2416,13 +2459,13 @@ class NotifierWorker(threading.Thread):
         elapsed = int((time.perf_counter() - check_started) * 1000)
         log_file("SLA_CHECK_DONE", f"warnings={warnings};elapsed_ms={elapsed};total={total}")
         return warnings
-    def run_scan(self, fetch_only=False, force_first_alert_for_existing=False, _retry_after_recover=False):
+    def run_scan(self, fetch_only=False, _retry_after_recover=False):
         """
         Runs exactly one browser operation at a time.
         This prevents auto-fetch and monitor actions from touching the same Sentinel tab together.
         """
         run_id = int(time.time() * 1000)
-        log_file("RUN_SCAN_CALL", f"run_id={run_id};fetch_only={fetch_only};force_first={force_first_alert_for_existing}")
+        log_file("RUN_SCAN_CALL", f"run_id={run_id};fetch_only={fetch_only}")
         self.last_operation_ok = False
         with self.operation_lock:
             if self.operation_in_progress:
@@ -2497,7 +2540,7 @@ class NotifierWorker(threading.Thread):
                     return scanned, processed
 
                 sla_start = time.perf_counter()
-                warnings = self.check_sla(force_first_alert_for_existing=force_first_alert_for_existing)
+                warnings = self.check_sla()
                 sla_ms = int((time.perf_counter() - sla_start) * 1000)
                 total_ms = int((time.perf_counter() - run_started) * 1000)
                 log_file(
@@ -2537,7 +2580,7 @@ class NotifierWorker(threading.Thread):
                         self.store.log_system('FETCH' if fetch_only else 'SCAN', 'RETRY_AFTER_RECOVERY', f'fetch_only={fetch_only}')
                         self.emit('status', {'message':'Tab Sentinel recuperata, ritento operazione una sola volta...', 'settings': self.settings_dict()})
                         self.set_runtime_state(operation_in_progress=False, operation_kind='')
-                        return self.run_scan(fetch_only=fetch_only, force_first_alert_for_existing=force_first_alert_for_existing, _retry_after_recover=True)
+                        return self.run_scan(fetch_only=fetch_only, _retry_after_recover=True)
                 self.emit('error', {'message': details, 'actions': self.store.actions()})
                 self.emit('status', {'message': f"{'Fetch' if fetch_only else 'Scan'} fallito: {type(e).__name__}", 'settings': self.settings_dict()})
                 log_file("RUN_SCAN_ERROR", f"{type(e).__name__}")
@@ -2582,19 +2625,24 @@ class NotifierWorker(threading.Thread):
                 self.emit('status', {'message':'Tab browser aggiornate.', 'settings':self.settings_dict()})
 
             elif a == 'select_page':
-                self.target_page_id = cmd.get('page_id')
-                page = self.pages.get(self.target_page_id)
+                requested_page_id = cmd.get('page_id')
+                page = self.pages.get(requested_page_id)
+                if page is None or not self.page_looks_like_sentinel(page):
+                    message = 'La tab selezionata non e una pagina Sentinel valida. Aggiorna le tab e riprova.'
+                    self.emit('error', {'message': message, 'settings': self.settings_dict()})
+                    log_file("HANDLE_SELECT_PAGE_REJECT", f"target={requested_page_id}")
+                    return
+                self.target_page_id = requested_page_id
                 meta = {}
-                if page is not None:
-                    try:
-                        meta['url'] = page.url or ''
-                    except Exception:
-                        meta['url'] = ''
-                    try:
-                        meta['title'] = page.title() or ''
-                    except Exception:
-                        meta['title'] = ''
-                    meta['browser'] = self.target_page_id.split(':', 1)[0] if ':' in str(self.target_page_id or '') else ''
+                try:
+                    meta['url'] = page.url or ''
+                except Exception:
+                    meta['url'] = ''
+                try:
+                    meta['title'] = page.title() or ''
+                except Exception:
+                    meta['title'] = ''
+                meta['browser'] = self.target_page_id.split(':', 1)[0] if ':' in str(self.target_page_id or '') else ''
                 self.target_page_meta = meta
                 self.set_runtime_state(auto_fetch_enabled=True, stop_requested=False)
                 self.store.log_system('SELECT_PAGE', 'SUCCESS', str(self.target_page_id))
@@ -2616,7 +2664,7 @@ class NotifierWorker(threading.Thread):
                 self.set_runtime_state(stop_requested=False, starting=False)
                 log_file("HANDLE_FETCH", f"target={self.target_page_id}")
                 self.emit('status', {'message':'Fetching selected Sentinel tab without refreshing page...', 'settings':self.settings_dict()})
-                self.run_scan(fetch_only=True, force_first_alert_for_existing=True)
+                self.run_scan(fetch_only=True)
                 self.last_fetch_ts = time.time()
                 log_file("HANDLE_FETCH_DONE", f"target={self.target_page_id};last_fetch_ts={self.last_fetch_ts}")
 
@@ -2633,7 +2681,7 @@ class NotifierWorker(threading.Thread):
                 self.emit('status', {'message':'Initial fetch before monitor start...', 'settings':self.settings_dict()})
 
                 # Initial fetch first, then enable the real/dry-run monitor.
-                self.run_scan(fetch_only=True, force_first_alert_for_existing=True)
+                self.run_scan(fetch_only=True)
                 if not self.last_operation_ok:
                     self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False)
                     self.store.log_system('monitor_START', 'BLOCKED', 'Initial fetch failed; monitor not started')
@@ -2648,14 +2696,13 @@ class NotifierWorker(threading.Thread):
                 log_file("HANDLE_START_DONE", f"state={self.get_runtime_state()}")
 
             elif a == 'pause':
-                self.set_runtime_state(paused=True, auto_fetch_enabled=False)
+                self.request_pause()
                 self.store.log_system('monitor_PAUSE', 'SUCCESS', '')
                 self.emit('status', {'message':'Monitor paused. Auto-fetch disabled.', 'settings':self.settings_dict()})
                 log_file("HANDLE_PAUSE", "")
 
             elif a == 'resume':
-                self.set_runtime_state(stop_requested=False)
-                self.set_runtime_state(paused=False, running_monitor=True, auto_fetch_enabled=False)
+                self.request_resume()
                 self.store.log_system('monitor_RESUME', 'SUCCESS', '')
                 self.emit('status', {'message':'Monitor resumed. Auto-fetch disabled while monitor is running.', 'settings':self.settings_dict()})
                 log_file("HANDLE_RESUME", "")
@@ -2663,8 +2710,7 @@ class NotifierWorker(threading.Thread):
 
             elif a == 'stop':
                 # Stop means stop monitor and stop background auto-fetch.
-                self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, stop_requested=True)
-                self.session_first_notified_keys.clear()
+                self.request_stop()
                 self.store.log_system('monitor_STOP', 'SUCCESS', 'Monitor stopped; auto-fetch disabled')
                 self.emit('status', {'message':'Monitor stopped. Auto-fetch disabled; use FETCH CURRENT VIEW for manual refresh.', 'settings':self.settings_dict()})
                 log_file("HANDLE_STOP", "stop_requested=true")
@@ -2694,8 +2740,7 @@ class NotifierWorker(threading.Thread):
                 log_file("HANDLE_UNIGNORE_ALL", "")
 
             elif a == 'shutdown':
-                self.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, shutdown_requested=True)
-                self.session_first_notified_keys.clear()
+                self.request_stop(shutdown=True)
                 self.store.log_system('APP_SHUTDOWN', 'REQUESTED', '')
                 self.cleanup_playwright()
                 self.emit('status', {'message':'Shutdown complete', 'settings':self.settings_dict()})
@@ -2715,6 +2760,7 @@ class NotifierWorker(threading.Thread):
                 try:
                     cmd = self.in_q.get(timeout=1)
                     self.handle(cmd)
+                    self.emit('command_complete', {'action': cmd.get('action')})
                 except queue.Empty:
                     pass
 
@@ -2736,7 +2782,7 @@ class NotifierWorker(threading.Thread):
                 ):
                     self.emit('status', {'message':'Auto-fetch current Sentinel view...', 'settings':self.settings_dict()})
                     log_file("RUN_LOOP_TRIGGER", f"auto_fetch_interval={self.settings.auto_fetch_interval_seconds};target={self.target_page_id}")
-                    self.run_scan(fetch_only=True, force_first_alert_for_existing=False)
+                    self.run_scan(fetch_only=True)
                     self.last_fetch_ts = time.time()
 
                 state = self.get_runtime_state()
@@ -2876,67 +2922,10 @@ def wait_debug_port_alive(port, timeout_seconds=12):
     return False
 
 def launch_browser_debug(browser):
-    """
-    Avvia un'istanza Chromium debuggabile e separata dalle finestre normali.
-    Questo evita il problema principale: se Chrome e' gia' aperto normalmente,
-    Windows/Chrome tende a riusare il processo esistente e la porta 9222 non viene attivata.
-    """
-    exe=find_chrome_path() if browser=='chrome' else find_edge_path()
-    port=CHROME_DEBUG_PORT if browser=='chrome' else EDGE_DEBUG_PORT
-    profile_dir=browser_profile_dir(browser)
-
-    if not exe:
-        messagebox.showerror('Browser non trovato', f'{browser} non trovato.')
-        return False
-
-    if _debug_port_alive(port):
-        owner_pids = [
-            pid for pid in _debug_port_owner_pids(port)
-            if _is_owned_debug_browser_process(pid, browser, port)
-        ]
-        if not owner_pids:
-            log_file("LAUNCH_BROWSER_BLOCKED", f"browser={browser};port={port};reason=debug_port_not_owned")
-            messagebox.showwarning('Porta debug non sicura', f'La porta debug {port} e gia attiva ma non sembra appartenere al profilo controllato dell app.')
-            return False
-        log_file("LAUNCH_BROWSER_SKIP", f"browser={browser};port={port};reason=already_listening")
-        return True
-
-    terminate_debug_port_owner(browser, port, reason='launch_debug_port_not_responding')
-
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    args=[
-        exe,
-        f'--remote-debugging-port={port}',
-        '--remote-debugging-address=127.0.0.1',
-        '--remote-allow-origins=*',
-        f'--user-data-dir={str(profile_dir)}',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--restore-last-session',
-        '--hide-crash-restore-bubble',
-        '--start-minimized',
-        '--new-window',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-background-timer-throttling',
-        '--disable-features=CalculateNativeWinOcclusion',
-        'https://portal.azure.com/'
-    ]
-
-    log_file("LAUNCH_BROWSER_START", f"browser={browser};port={port}")
-    try:
-        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log_file("LAUNCH_BROWSER_OK", f"browser={browser};profile={profile_dir};pid={proc.pid}")
-        if wait_debug_port_alive(port, timeout_seconds=12):
-            log_file("LAUNCH_BROWSER_READY", f"browser={browser};port={port};pid={proc.pid}")
-            return True
-        log_file("LAUNCH_BROWSER_NOT_READY", f"browser={browser};port={port};pid={proc.pid}")
-        return False
-    except Exception as e:
-        log_file("LAUNCH_BROWSER_FAIL", f"browser={browser};err={str(e)}")
-        messagebox.showerror('Errore avvio browser', str(e))
-        return False
+    result = launch_controlled_browser(sys.modules[__name__], browser)
+    if not result.ok:
+        messagebox.showerror('Errore avvio browser', result.error)
+    return result.ok
 
 class NotifierApp(tk.Tk):
     def __init__(self):
@@ -3338,11 +3327,7 @@ class NotifierApp(tk.Tk):
 
     def stop_monitor(self):
         log_file("UI_STOP", "")
-        self.worker.set_runtime_state(running_monitor=False, paused=False, starting=False, auto_fetch_enabled=False, stop_requested=True)
-        try:
-            self.worker.session_first_notified_keys.clear()
-        except Exception:
-            pass
+        self.worker.request_stop()
         self.status_var.set('Monitor stopped. Auto-fetch disabled.')
         self.send('stop')
 
